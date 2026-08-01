@@ -144,6 +144,7 @@ static const char * const resident_page_types[] = {
 	NAMED_ARRAY_INDEX(MM_ANONPAGES),
 	NAMED_ARRAY_INDEX(MM_SWAPENTS),
 	NAMED_ARRAY_INDEX(MM_SHMEMPAGES),
+	NAMED_ARRAY_INDEX(MM_NAMED_SWAPPAGES),
 };
 
 DEFINE_PER_CPU(unsigned long, process_counts) = 0;
@@ -630,17 +631,160 @@ static void dup_mm_exe_file(struct mm_struct *mm, struct mm_struct *oldmm)
 }
 
 #ifdef CONFIG_MMU
+struct named_swap_fork_file {
+	unsigned long start;
+	unsigned long end;
+	pgoff_t pgoff;
+	struct file *child_file;
+	struct file *parent_file;
+};
+
+struct named_swap_fork_files {
+	struct named_swap_fork_file *files;
+	unsigned int nr;
+	unsigned int next;
+};
+
+static void named_swap_fork_files_put(struct named_swap_fork_files *prepared)
+{
+	unsigned int i;
+
+	if (!prepared->files)
+		return;
+
+	for (i = 0; i < prepared->nr; i++) {
+		if (prepared->files[i].child_file)
+			fput(prepared->files[i].child_file);
+		if (prepared->files[i].parent_file)
+			fput(prepared->files[i].parent_file);
+	}
+	kfree(prepared->files);
+	prepared->files = NULL;
+	prepared->nr = 0;
+	prepared->next = 0;
+}
+
+static bool vma_needs_named_swap_fork_file(struct vm_area_struct *vma)
+{
+	return !(vma->vm_flags & VM_DONTCOPY) &&
+	       vma->vm_file &&
+	       mapping_named_swap(vma->vm_file->f_mapping);
+}
+
+static int named_swap_prepare_fork_files(struct mm_struct *oldmm,
+					 struct named_swap_fork_files *prepared)
+{
+	struct vm_area_struct *vma;
+	unsigned int nr = 0, i = 0;
+	VMA_ITERATOR(vmi, oldmm, 0);
+	int ret = 0;
+
+	prepared->files = NULL;
+	prepared->nr = 0;
+	prepared->next = 0;
+
+	if (mmap_read_lock_killable(oldmm))
+		return -EINTR;
+
+	for_each_vma(vmi, vma) {
+		if (vma_needs_named_swap_fork_file(vma))
+			nr++;
+	}
+
+	if (nr) {
+		prepared->files = kcalloc(nr, sizeof(*prepared->files),
+					  GFP_KERNEL);
+		if (!prepared->files) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+
+		vma_iter_init(&vmi, oldmm, 0);
+		for_each_vma(vmi, vma) {
+			struct named_swap_fork_file *file;
+
+			if (!vma_needs_named_swap_fork_file(vma))
+				continue;
+			if (WARN_ON_ONCE(i >= nr)) {
+				ret = -EAGAIN;
+				goto unlock;
+			}
+
+			file = &prepared->files[i++];
+			file->start = vma->vm_start;
+			file->end = vma->vm_end;
+			file->pgoff = vma->vm_pgoff;
+		}
+	}
+
+	prepared->nr = i;
+unlock:
+	mmap_read_unlock(oldmm);
+	if (ret)
+		goto out_free;
+
+	for (i = 0; i < prepared->nr; i++) {
+		unsigned long len = prepared->files[i].end -
+				    prepared->files[i].start;
+		struct file *file;
+
+		file = named_swap_prepare_mmap(len, NULL);
+		if (IS_ERR_OR_NULL(file)) {
+			ret = file ? PTR_ERR(file) : -ENOMEM;
+			goto out_free;
+		}
+		prepared->files[i].child_file = file;
+
+		file = named_swap_prepare_mmap(len, NULL);
+		if (IS_ERR_OR_NULL(file)) {
+			ret = file ? PTR_ERR(file) : -ENOMEM;
+			goto out_free;
+		}
+		prepared->files[i].parent_file = file;
+	}
+
+	return 0;
+
+out_free:
+	named_swap_fork_files_put(prepared);
+	return ret;
+}
+
+static struct named_swap_fork_file *
+named_swap_next_fork_file(struct named_swap_fork_files *prepared,
+			  struct vm_area_struct *vma)
+{
+	struct named_swap_fork_file *file;
+
+	if (prepared->next >= prepared->nr)
+		return ERR_PTR(-EAGAIN);
+
+	file = &prepared->files[prepared->next];
+	if (file->start != vma->vm_start ||
+	    file->end != vma->vm_end ||
+	    file->pgoff != vma->vm_pgoff)
+		return ERR_PTR(-EAGAIN);
+
+	prepared->next++;
+	return file;
+}
+
 static __latent_entropy int dup_mmap(struct mm_struct *mm,
 					struct mm_struct *oldmm)
 {
 	struct vm_area_struct *mpnt, *tmp;
 	int retval;
 	unsigned long charge = 0;
+	struct named_swap_fork_files prepared_named_swap;
 	LIST_HEAD(uf);
 	VMA_ITERATOR(vmi, mm, 0);
 
+	retval = named_swap_prepare_fork_files(oldmm, &prepared_named_swap);
+	if (retval)
+		return retval;
+
 	if (mmap_write_lock_killable(oldmm))
-		return -EINTR;
+		goto fail_named_swap_prepare;
 	flush_cache_dup_mm(oldmm);
 	uprobe_dup_mmap(oldmm, mm);
 	/*
@@ -731,17 +875,44 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		file = tmp->vm_file;
 		if (file) {
 			struct address_space *mapping = file->f_mapping;
+			if (mapping_named_swap(mapping))
+			{
+				struct named_swap_fork_file *prepared;
 
-			get_file(file);
-			i_mmap_lock_write(mapping);
-			if (vma_is_shared_maywrite(tmp))
-				mapping_allow_writable(mapping);
-			flush_dcache_mmap_lock(mapping);
-			/* insert tmp into the share list, just after mpnt */
-			vma_interval_tree_insert_after(tmp, mpnt,
-					&mapping->i_mmap);
-			flush_dcache_mmap_unlock(mapping);
-			i_mmap_unlock_write(mapping);
+				prepared = named_swap_next_fork_file(&prepared_named_swap,
+								     mpnt);
+				if (IS_ERR(prepared)) {
+					retval = PTR_ERR(prepared);
+					goto loop_out;
+				}
+				tmp->vm_file = prepared->child_file;
+				prepared->child_file = NULL;
+				if (anon_vma_prepare_exclusive(tmp)) {
+					retval = -ENOMEM;
+					goto loop_out;
+				}
+				named_swap_link(tmp);
+				//now the parent also has a new anon_vma, so we need to create a new file and link it
+				mpnt->vm_file = prepared->parent_file;
+				prepared->parent_file = NULL;
+				if (anon_vma_prepare_exclusive(mpnt)) {
+					retval = -ENOMEM;
+					goto loop_out;
+				}
+				named_swap_link(mpnt);
+			}
+			else {
+				get_file(file);
+				i_mmap_lock_write(mapping);
+				if (vma_is_shared_maywrite(tmp))
+					mapping_allow_writable(mapping);
+				flush_dcache_mmap_lock(mapping);
+				/* insert tmp into the share list, just after mpnt */
+				vma_interval_tree_insert_after(tmp, mpnt,
+						&mapping->i_mmap);
+				flush_dcache_mmap_unlock(mapping);
+				i_mmap_unlock_write(mapping);
+			}
 		}
 
 		if (!(tmp->vm_flags & VM_WIPEONFORK))
@@ -790,6 +961,7 @@ out:
 		dup_userfaultfd_complete(&uf);
 	else
 		dup_userfaultfd_fail(&uf);
+	named_swap_fork_files_put(&prepared_named_swap);
 	return retval;
 
 fail_nomem_anon_vma_fork:
@@ -800,6 +972,11 @@ fail_nomem:
 	retval = -ENOMEM;
 	vm_unacct_memory(charge);
 	goto loop_out;
+
+fail_named_swap_prepare:
+	retval = -EINTR;
+	named_swap_fork_files_put(&prepared_named_swap);
+	return retval;
 }
 
 static inline int mm_alloc_pgd(struct mm_struct *mm)

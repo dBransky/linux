@@ -153,6 +153,7 @@ static inline void anon_vma_unlock_read(struct anon_vma *anon_vma)
  */
 void anon_vma_init(void);	/* create anon_vma_cachep */
 int  __anon_vma_prepare(struct vm_area_struct *);
+int  __anon_vma_prepare_exclusive(struct vm_area_struct *);
 void unlink_anon_vmas(struct vm_area_struct *);
 int anon_vma_clone(struct vm_area_struct *, struct vm_area_struct *);
 int anon_vma_fork(struct vm_area_struct *, struct vm_area_struct *);
@@ -163,6 +164,20 @@ static inline int anon_vma_prepare(struct vm_area_struct *vma)
 		return 0;
 
 	return __anon_vma_prepare(vma);
+}
+
+/*
+ * Allocate a new anon_vma without searching neighbours. Required when
+ * the VMA is not in the maple tree yet (named-swap fork child) or when
+ * the VMA just received a new named-swap file that must not inherit a
+ * neighbour's anon_vma/file binding.
+ */
+static inline int anon_vma_prepare_exclusive(struct vm_area_struct *vma)
+{
+	if (likely(vma->anon_vma))
+		return 0;
+
+	return __anon_vma_prepare_exclusive(vma);
 }
 
 static inline void anon_vma_merge(struct vm_area_struct *vma,

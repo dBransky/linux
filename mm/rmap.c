@@ -189,7 +189,7 @@ static void anon_vma_chain_link(struct vm_area_struct *vma,
  * to do any locking for the common case of already having
  * an anon_vma.
  */
-int __anon_vma_prepare(struct vm_area_struct *vma)
+static int __anon_vma_prepare_common(struct vm_area_struct *vma, bool isolated)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct anon_vma *anon_vma, *allocated;
@@ -202,7 +202,12 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	if (!avc)
 		goto out_enomem;
 
-	anon_vma = find_mergeable_anon_vma(vma);
+	if (isolated && vma_is_named_swap(vma))
+		anon_vma = vma->vm_file->f_mapping->anon_vma;
+	else if (isolated)
+		anon_vma = NULL;
+	else
+		anon_vma = find_mergeable_anon_vma(vma);
 	allocated = NULL;
 	if (!anon_vma) {
 		anon_vma = anon_vma_alloc();
@@ -210,6 +215,28 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 			goto out_enomem_free_avc;
 		anon_vma->num_children++; /* self-parent link for new root */
 		allocated = anon_vma;
+		/*
+		 * Split named-swap windows share one file. Publish the
+		 * new anon_vma on the mapping so a concurrent first
+		 * fault adopts it instead of allocating a second one
+		 * and tripping named_swap_link()'s one-file invariant.
+		 */
+		if (isolated && vma_is_named_swap(vma)) {
+			struct anon_vma *claimed;
+
+			claimed = named_swap_claim_anon_vma(vma->vm_file,
+							    allocated);
+			if (claimed != allocated) {
+				put_anon_vma(allocated);
+				allocated = NULL;
+				anon_vma = claimed;
+				if (!anon_vma)
+					goto out_enomem_free_avc;
+			} else {
+				/* mapping now owns this allocation */
+				allocated = NULL;
+			}
+		}
 	}
 
 	anon_vma_lock_write(anon_vma);
@@ -236,6 +263,16 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	anon_vma_chain_free(avc);
  out_enomem:
 	return -ENOMEM;
+}
+
+int __anon_vma_prepare(struct vm_area_struct *vma)
+{
+	return __anon_vma_prepare_common(vma, false);
+}
+
+int __anon_vma_prepare_exclusive(struct vm_area_struct *vma)
+{
+	return __anon_vma_prepare_common(vma, true);
 }
 
 /*
