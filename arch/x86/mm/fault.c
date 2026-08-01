@@ -830,6 +830,8 @@ static noinline void
 bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
 		     unsigned long address)
 {
+	/* No VMA. Cursor scavenger NULL-Map faults here (addr ~0xa). */
+	named_swap_debug_user_segv(regs, address, error_code, SEGV_MAPERR, NULL);
 	__bad_area_nosemaphore(regs, error_code, address, 0, SEGV_MAPERR);
 }
 
@@ -842,6 +844,8 @@ __bad_area(struct pt_regs *regs, unsigned long error_code,
 	 * Something tried to access memory that isn't in our memory map..
 	 * Fix it, but check if it's kernel or user first..
 	 */
+	named_swap_debug_user_segv(regs, address, error_code, si_code, vma);
+
 	if (mm)
 		mmap_read_unlock(mm);
 	else

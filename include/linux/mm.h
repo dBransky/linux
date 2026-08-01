@@ -40,6 +40,7 @@ struct anon_vma_chain;
 struct user_struct;
 struct pt_regs;
 struct folio_batch;
+struct seq_file;
 
 extern int sysctl_page_lock_unfairness;
 
@@ -933,6 +934,13 @@ static inline void vm_flags_mod(struct vm_area_struct *vma,
 
 #define NAMED_SWAP_PATH_LEN	256
 extern int named_swap_min_vma_size;
+extern int named_swap_debug;
+
+#define NAMED_SWAP_DBG_HIST	0x01	/* record enlarge/shrink ring */
+#define NAMED_SWAP_DBG_PRINT	0x02	/* printk every resize */
+#define NAMED_SWAP_DBG_SEGV	0x04	/* dump VMA+hist on user SIGSEGV */
+#define NAMED_SWAP_DBG_ASSERT	0x08	/* i_size / fault-past-EOF */
+#define NAMED_SWAP_DBG_STACK	0x10	/* dump_stack on each resize */
 extern char named_swap_root[NAMED_SWAP_PATH_LEN];
 int proc_named_swap_root(const struct ctl_table *table, int write,
 			 void *buffer, size_t *lenp, loff_t *ppos);
@@ -947,6 +955,13 @@ bool named_swap_single_vma_mapping(struct vm_area_struct *vma);
 unsigned int named_swap_same_file_pte_count(struct vm_area_struct *vma,
 					   unsigned long address);
 void setup_named_swap_vmf(struct vm_fault *vmf);
+void named_swap_debug_user_segv(struct pt_regs *regs, unsigned long address,
+				unsigned long error_code, int si_code,
+				struct vm_area_struct *vma);
+void named_swap_check_fault(struct vm_fault *vmf);
+int named_swap_hist_show(struct seq_file *m, void *v);
+void named_swap_note_written(struct vm_area_struct *vma, unsigned long addr);
+void named_swap_check_zero_read(struct vm_area_struct *vma, unsigned long addr);
 void named_swap_store_pte(struct mm_struct *mm, struct vm_area_struct *vma,
 			  unsigned long address, pte_t *pte);
 
