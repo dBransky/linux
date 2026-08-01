@@ -78,6 +78,7 @@
 #include <linux/sched/sysctl.h>
 
 #include <trace/events/kmem.h>
+#include <trace/events/named_swap.h>
 
 #include <asm/io.h>
 #include <asm/mmu_context.h>
@@ -104,6 +105,7 @@ EXPORT_SYMBOL(mem_map);
 
 static vm_fault_t do_fault(struct vm_fault *vmf);
 static vm_fault_t do_anonymous_page(struct vm_fault *vmf);
+static vm_fault_t do_numa_page(struct vm_fault *vmf);
 static bool vmf_pte_changed(struct vm_fault *vmf);
 
 /*
@@ -1657,6 +1659,8 @@ static inline int zap_nonpresent_ptes(struct mmu_gather *tlb,
 	} else if (is_hwpoison_entry(entry) || is_poisoned_swp_entry(entry)) {
 		if (!should_zap_cows(details))
 			return 1;
+	} else if (is_named_swap_entry(entry)) {
+		VM_BUG_ON_VMA(!vma_is_named_swap(vma), vma);
 	} else {
 		/* We should have covered all the swap entry types */
 		pr_alert("unrecognized swap entry 0x%lx\n", entry.val);
@@ -3294,7 +3298,7 @@ static vm_fault_t fault_dirty_shared_page(struct vm_fault *vmf)
 	mapping = folio_raw_mapping(folio);
 	folio_unlock(folio);
 
-	if (!page_mkwrite)
+	if (!page_mkwrite && !vma_is_named_swap(vma))
 		file_update_time(vma->vm_file);
 
 	/*
@@ -3305,6 +3309,12 @@ static vm_fault_t fault_dirty_shared_page(struct vm_fault *vmf)
 	 *
 	 * Drop the mmap_lock before waiting on IO, if we can. The file
 	 * is pinning the mapping, as per above.
+	 *
+	 * Named-swap keeps the same dirty balancing as a shared file map
+	 * so background writeback runs before reclaim. First-touch cost
+	 * is dominated by allocating page-cache folios (missing_write),
+	 * not by this throttle — skipping it previously left a reclaim
+	 * cliff of fully-dirty pages on the first cycle.
 	 */
 	if ((dirtied || page_mkwrite) && mapping) {
 		struct file *fpin;
@@ -5139,7 +5149,7 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
 	if (unlikely(vmf_orig_pte_uffd_wp(vmf)))
 		entry = pte_mkuffd_wp(entry);
 	/* copy-on-write page */
-	if (write && !(vma->vm_flags & VM_SHARED)) {
+	if (write && !(vma->vm_flags & VM_SHARED) && !vma_is_named_swap(vma)) {
 		VM_BUG_ON_FOLIO(nr != 1, folio);
 		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(folio, vma);
@@ -5182,7 +5192,8 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
 	struct folio *folio;
 	vm_fault_t ret;
 	bool is_cow = (vmf->flags & FAULT_FLAG_WRITE) &&
-		      !(vma->vm_flags & VM_SHARED);
+		      !(vma->vm_flags & VM_SHARED) &&
+		      !vma_is_named_swap(vma);
 	int type, nr_pages;
 	unsigned long addr;
 	bool needs_fallback = false;
@@ -5268,7 +5279,6 @@ fallback:
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		goto fallback;
 	}
-
 	folio_ref_add(folio, nr_pages - 1);
 	set_pte_range(vmf, folio, page, nr_pages, addr);
 	type = is_cow ? MM_ANONPAGES : mm_counter_file(folio);
@@ -5418,29 +5428,128 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
 	return ret;
 }
 
+static vm_fault_t finish_named_swap_cow_fault(struct vm_fault *vmf,
+		struct folio *old_folio, struct page *old_page,
+		struct folio *new_folio)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mmu_notifier_range range;
+	pte_t entry;
+	vm_fault_t ret = VM_FAULT_NOPAGE;
+
+	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
+				vmf->address & PAGE_MASK,
+				(vmf->address & PAGE_MASK) + PAGE_SIZE);
+	mmu_notifier_invalidate_range_start(&range);
+
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address,
+				       &vmf->ptl);
+	if (likely(vmf->pte && pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+		entry = mk_pte(vmf->page, vma->vm_page_prot);
+		entry = pte_sw_mkyoung(entry);
+		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+		if (unlikely(vmf_orig_pte_uffd_wp(vmf)))
+			entry = pte_mkuffd_wp(entry);
+
+		ptep_clear_flush(vma, vmf->address, vmf->pte);
+		folio_add_file_rmap_pte(new_folio, vmf->page, vma);
+		set_pte_at(mm, vmf->address, vmf->pte, entry);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+
+		add_mm_counter(mm, mm_counter_file(new_folio), 1);
+		dec_mm_counter(mm, mm_counter_file(old_folio));
+		folio_remove_rmap_pte(old_folio, old_page, vma);
+		folio_put(old_folio);
+		ret = 0;
+	} else if (vmf->pte) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+	}
+	if (vmf->pte)
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	mmu_notifier_invalidate_range_end(&range);
+	return ret;
+}
+
 static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio;
-	vm_fault_t ret;
+	struct folio *old_folio = NULL;
+	struct page *old_page = NULL;
+	vm_fault_t ret, tmp;
+	bool named_swap = vma_is_named_swap(vma);
 
 	ret = vmf_can_call_fault(vmf);
 	if (!ret)
 		ret = vmf_anon_prepare(vmf);
 	if (ret)
 		return ret;
+	if (named_swap) {
+		VM_BUG_ON(!(vmf->page));
+		old_page = vmf->page;
+		old_folio = page_folio(old_page);
+	} else {
+		folio = folio_prealloc(vma->vm_mm, vma, vmf->address, false);
+		if (!folio)
+			return VM_FAULT_OOM;
 
-	folio = folio_prealloc(vma->vm_mm, vma, vmf->address, false);
-	if (!folio)
-		return VM_FAULT_OOM;
-
-	vmf->cow_page = &folio->page;
+		vmf->cow_page = &folio->page;
+	}
 
 	ret = __do_fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		goto uncharge_out;
-	if (ret & VM_FAULT_DONE_COW)
+	if (ret & VM_FAULT_DONE_COW) {
+		if (named_swap)
+			folio_put(old_folio);
 		return ret;
+	}
+
+	if (named_swap) {
+		struct folio *new_folio = page_folio(vmf->page);
+
+		if (WARN_ON_ONCE(new_folio == old_folio)) {
+			folio_unlock(new_folio);
+			folio_put(new_folio);
+			folio_put(old_folio);
+			return VM_FAULT_SIGBUS;
+		}
+
+		if (copy_mc_user_highpage(vmf->page, old_page,
+					  vmf->address, vma)) {
+			unlock_page(vmf->page);
+			put_page(vmf->page);
+			folio_put(old_folio);
+			return VM_FAULT_HWPOISON;
+		}
+		__folio_mark_uptodate(new_folio);
+
+		folio_unlock(new_folio);
+		tmp = do_page_mkwrite(vmf, new_folio);
+		if (unlikely(!tmp ||
+			     (tmp & (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
+			folio_put(new_folio);
+			folio_put(old_folio);
+			return tmp;
+		}
+
+		ret |= finish_named_swap_cow_fault(vmf, old_folio, old_page,
+						   new_folio);
+		if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE |
+				    VM_FAULT_RETRY))) {
+			if (folio_test_locked(new_folio))
+				folio_unlock(new_folio);
+			folio_put(new_folio);
+			folio_put(old_folio);
+			return ret;
+		}
+		folio_put(old_folio);
+
+		return fault_dirty_shared_page(vmf);
+	}
 
 	if (copy_mc_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma)) {
 		ret = VM_FAULT_HWPOISON;
@@ -5456,7 +5565,11 @@ unlock:
 		goto uncharge_out;
 	return ret;
 uncharge_out:
-	folio_put(folio);
+	if (named_swap) {
+		folio_put(old_folio);
+	} else {
+		folio_put(folio);
+	}
 	return ret;
 }
 
@@ -5539,12 +5652,13 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 		}
-	} else if (!(vmf->flags & FAULT_FLAG_WRITE))
+	} else if (!(vmf->flags & FAULT_FLAG_WRITE)) {
 		ret = do_read_fault(vmf);
-	else if (!(vma->vm_flags & VM_SHARED))
+	} else if (!(vma->vm_flags & VM_SHARED) && !vma_is_named_swap(vma)) {
 		ret = do_cow_fault(vmf);
-	else
+	} else {
 		ret = do_shared_fault(vmf);
+	}
 
 	/* preallocated pagetable is unused: free it */
 	if (vmf->prealloc_pte) {
@@ -5552,6 +5666,456 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 		vmf->prealloc_pte = NULL;
 	}
 	return ret;
+}
+
+static vm_fault_t named_swap_prepare_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+
+	/*
+	 * Split named-swap VMAs share one file. find_mergeable_anon_vma()
+	 * will not join pgoff windows, so a normal prepare would allocate
+	 * a second anon_vma and named_swap_link() VM_BUG_ON. Adopt the
+	 * file's existing anon_vma, or allocate an isolated one.
+	 *
+	 * First-fault needs mmap_lock (__anon_vma_prepare_* asserts it).
+	 */
+	if (!vma->anon_vma) {
+		/*
+		 * Do not take mmap_lock under the per-VMA lock (that
+		 * inverts mmap → vma_start_write). Drop the VMA lock
+		 * and retry with mmap held, like vmf_anon_prepare()
+		 * does on trylock failure.
+		 */
+		if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+			vma_end_read(vma);
+			return VM_FAULT_RETRY;
+		}
+		if (anon_vma_prepare_exclusive(vma))
+			return VM_FAULT_OOM;
+	}
+	/*
+	 * After the first fault the anon_vma is already bound to this
+	 * named-swap file; skip the bind lock/trace on the hot path.
+	 */
+	if (unlikely(!vma->anon_vma ||
+		     !vma->anon_vma->named_swap_file ||
+		     vma->anon_vma->named_swap_file != vma->vm_file))
+		named_swap_link(vma);
+	vmf->vm_file = vma->vm_file;
+	return 0;
+}
+
+static u64 named_swap_vmf_index(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vm_file ? vmf->vm_file : vmf->vma->vm_file;
+	u64 index = NAMED_SWAP_INDEX_NONE;
+
+	if (file)
+		named_swap_file_index(file, &index);
+	return index;
+}
+
+static void trace_named_swap_vmf_fault(struct vm_fault *vmf,
+		enum named_swap_fault_path path, unsigned int alias_count,
+		int mapcount, vm_fault_t ret)
+{
+	trace_named_swap_fault(vmf->vma, vmf->address, vmf->flags,
+			       named_swap_vmf_index(vmf), path, alias_count,
+			       mapcount, ret);
+}
+
+static vm_fault_t named_swap_missing_write(struct vm_fault *vmf);
+
+static vm_fault_t named_swap_wp_zero(struct vm_fault *vmf)
+	__releases(vmf->ptl)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	vm_fault_t ret;
+
+	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_WP_ZERO,
+					   0, 0, 0);
+		return 0;
+	}
+
+	ptep_clear_flush(vma, vmf->address, vmf->pte);
+	ksm_might_unmap_zero_page(mm, vmf->orig_pte);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	vmf->pte = NULL;
+	vmf->flags &= ~FAULT_FLAG_ORIG_PTE_VALID;
+	ret = named_swap_prepare_fault(vmf);
+	if (unlikely(ret))
+		return ret;
+	/*
+	 * Same first-write semantics as a missing PTE: allocate a zeroed
+	 * page-cache folio in RAM. Do not fall through to filemap_fault(),
+	 * which would major-fault and readahead the fallocated zeros.
+	 */
+	ret = named_swap_missing_write(vmf);
+	trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_WP_ZERO, 0, 0, ret);
+	return ret;
+}
+
+static vm_fault_t named_swap_wp_reuse(struct vm_fault *vmf,
+				      struct folio *folio)
+	__releases(vmf->ptl)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	vm_fault_t ret = 0;
+	int mapcount = folio_mapcount(folio);
+
+	folio_get(folio);
+	vmf->vm_file = vma->vm_file;
+	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
+		vm_fault_t tmp;
+
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		tmp = vmf_can_call_fault(vmf);
+		if (tmp) {
+			folio_put(folio);
+			trace_named_swap_vmf_fault(vmf,
+						   NAMED_SWAP_FAULT_WP_REUSE,
+						   1, mapcount, tmp);
+			return tmp;
+		}
+
+		tmp = do_page_mkwrite(vmf, folio);
+		if (unlikely(!tmp ||
+			     (tmp & (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
+			folio_put(folio);
+			trace_named_swap_vmf_fault(vmf,
+						   NAMED_SWAP_FAULT_WP_REUSE,
+						   1, mapcount, tmp);
+			return tmp;
+		}
+
+		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+					       vmf->address, &vmf->ptl);
+		if (!vmf->pte) {
+			folio_unlock(folio);
+			folio_put(folio);
+			trace_named_swap_vmf_fault(vmf,
+						   NAMED_SWAP_FAULT_WP_REUSE,
+						   1, mapcount,
+						   VM_FAULT_NOPAGE);
+			return VM_FAULT_NOPAGE;
+		}
+		if (!pte_same(ptep_get(vmf->pte), vmf->orig_pte)) {
+			update_mmu_tlb(vma, vmf->address, vmf->pte);
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			folio_unlock(folio);
+			folio_put(folio);
+			trace_named_swap_vmf_fault(vmf,
+						   NAMED_SWAP_FAULT_WP_REUSE,
+						   1, mapcount,
+						   VM_FAULT_NOPAGE);
+			return VM_FAULT_NOPAGE;
+		}
+		wp_page_reuse(vmf, folio);
+	} else {
+		wp_page_reuse(vmf, folio);
+		folio_lock(folio);
+	}
+
+	ret |= fault_dirty_shared_page(vmf);
+	folio_put(folio);
+	trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_WP_REUSE, 1,
+				   mapcount, ret);
+	return ret;
+}
+
+static vm_fault_t named_swap_missing_write(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct address_space *mapping = vma->vm_file->f_mapping;
+	struct folio *folio;
+	vm_fault_t ret;
+
+	/*
+	 * First write to a named-swap page starts from zero-filled anonymous
+	 * semantics. Avoid a filemap read fault for the backing file's
+	 * initially-zero contents.
+	 */
+	folio = filemap_get_folio(mapping, vmf->pgoff);
+	if (!IS_ERR(folio)) {
+		folio_put(folio);
+		return do_pte_missing(vmf);
+	}
+
+	folio = __filemap_get_folio(mapping, vmf->pgoff,
+				    FGP_LOCK | FGP_ACCESSED | FGP_CREAT |
+				    FGP_WRITE, vmf->gfp_mask);
+	if (IS_ERR(folio))
+		return VM_FAULT_OOM;
+
+	folio_zero_range(folio, 0, folio_size(folio));
+	flush_dcache_folio(folio);
+	folio_mark_uptodate(folio);
+	vmf->page = folio_file_page(folio, vmf->pgoff);
+	vmf->vm_file = vma->vm_file;
+
+	/*
+	 * Must call ->page_mkwrite for filesystems like ext4 that attach
+	 * buffers here. Skipping it lets writeback run on pages without
+	 * buffers and corrupts data under reclaim.
+	 */
+	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
+		folio_unlock(folio);
+		ret = do_page_mkwrite(vmf, folio);
+		if (unlikely(!ret ||
+			     (ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
+			folio_put(folio);
+			return ret;
+		}
+	}
+
+	ret = finish_fault(vmf);
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE |
+			    VM_FAULT_RETRY))) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return ret;
+	}
+
+	named_swap_note_written(vma, vmf->address);
+	return fault_dirty_shared_page(vmf);
+}
+
+static vm_fault_t named_swap_read_zero(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+
+	named_swap_check_zero_read(vma, vmf->address);
+	pte_t entry, *pte;
+	vm_fault_t ret = 0;
+	pgoff_t nr_pages = READ_ONCE(fault_around_pages);
+	pgoff_t pte_off = pte_index(vmf->address);
+	pgoff_t vma_off = (vmf->address - vma->vm_start) >> PAGE_SHIFT;
+	pgoff_t from_pte, to_pte, i;
+	unsigned long addr;
+	unsigned int mapped = 0;
+
+	if (pte_alloc(vma->vm_mm, vmf->pmd))
+		return VM_FAULT_OOM;
+
+	entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
+				      vma->vm_page_prot));
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+				       vmf->address, &vmf->ptl);
+	if (!vmf->pte)
+		return 0;
+	if (vmf_pte_changed(vmf)) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock;
+	}
+
+	ret = check_stable_address_space(vma->vm_mm);
+	if (ret)
+		goto unlock;
+
+	if (userfaultfd_missing(vma)) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
+
+	if (vmf_orig_pte_uffd_wp(vmf))
+		entry = pte_mkuffd_wp(entry);
+
+	/*
+	 * Prefault adjacent empty PTEs with the global zero page. Read
+	 * faults intentionally do not create named-swap folios; batching
+	 * only the special zero PTE cuts RMW first-touch faults from two
+	 * per page toward one write fault per page (matching file mmap
+	 * hole fault-around behavior for the read half).
+	 */
+	if (nr_pages <= 1 || uffd_disable_fault_around(vma)) {
+		set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+		goto unlock;
+	}
+
+	from_pte = max(ALIGN_DOWN(pte_off, nr_pages),
+		       pte_off - min(pte_off, vma_off));
+	to_pte = min3(from_pte + nr_pages, (pgoff_t)PTRS_PER_PTE,
+		      pte_off + ((vma->vm_end - vmf->address) >> PAGE_SHIFT)) - 1;
+
+	pte = vmf->pte - (pte_off - from_pte);
+	addr = vmf->address - ((pte_off - from_pte) << PAGE_SHIFT);
+	for (i = from_pte; i <= to_pte; i++, pte++, addr += PAGE_SIZE) {
+		pte_t old = ptep_get(pte);
+
+		if (!pte_none(old))
+			continue;
+		set_pte_at(vma->vm_mm, addr, pte, entry);
+		mapped++;
+	}
+	if (mapped)
+		update_mmu_cache_range(vmf, vma,
+				       vmf->address - ((pte_off - from_pte) << PAGE_SHIFT),
+				       vmf->pte - (pte_off - from_pte),
+				       to_pte - from_pte + 1);
+
+unlock:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return ret;
+}
+
+static vm_fault_t do_named_swap_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	pte_t entry;
+	struct page *page;
+	struct folio *folio;
+	vm_fault_t ret;
+	int mapcount;
+
+	VM_BUG_ON_VMA(!vma_is_named_swap(vma), vma);
+	named_swap_check_fault(vmf);
+
+	if (!vmf->pte) {
+		ret = named_swap_prepare_fault(vmf);
+		if (unlikely(ret))
+			return ret;
+		if (!(vmf->flags & FAULT_FLAG_WRITE)) {
+			ret = named_swap_read_zero(vmf);
+			trace_named_swap_vmf_fault(vmf,
+						   NAMED_SWAP_FAULT_MISSING_READ,
+						   0, 0, ret);
+			return ret;
+		}
+		ret = named_swap_missing_write(vmf);
+		trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_MISSING_WRITE,
+					   0, 0, ret);
+		return ret;
+	}
+
+	if (!pte_present(vmf->orig_pte)) {
+		if (!is_named_swap_pte(vmf->orig_pte)) {
+			ret = do_swap_page(vmf);
+			trace_named_swap_vmf_fault(vmf,
+						   NAMED_SWAP_FAULT_SWAP_FALLBACK,
+						   0, 0, ret);
+			return ret;
+		}
+
+		setup_named_swap_vmf(vmf);
+		if (unlikely(vmf->pte)) {
+			pte_unmap(vmf->pte);
+			vmf->pte = NULL;
+			trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_SIGBUS,
+						   0, 0, VM_FAULT_SIGBUS);
+			return VM_FAULT_SIGBUS;
+		}
+		ret = do_fault(vmf);
+		trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_REFAULT, 0,
+					   0, ret);
+		return ret;
+	}
+
+	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vma)) {
+		ret = do_numa_page(vmf);
+		trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_ACCESS, 0,
+					   0, ret);
+		return ret;
+	}
+
+	spin_lock(vmf->ptl);
+	entry = vmf->orig_pte;
+	if (unlikely(!pte_same(ptep_get(vmf->pte), entry))) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock;
+	}
+	if (vmf->flags & (FAULT_FLAG_WRITE | FAULT_FLAG_UNSHARE)) {
+		if (!pte_write(entry)) {
+			if (is_zero_pfn(pte_pfn(entry)))
+				return named_swap_wp_zero(vmf);
+
+			page = vm_normal_page(vma, vmf->address, entry);
+			if (unlikely(!page))
+				goto unlock;
+
+			vmf->page = page;
+			folio = page_folio(page);
+			if (folio->mapping == vma->vm_file->f_mapping &&
+			    folio_mapcount(folio) == 1) {
+				unsigned int same_file_count;
+
+				/*
+				 * The alias walk locks PTEs, including the
+				 * faulting PTE. Drop this PTL first, then
+				 * revalidate before reusing the folio.
+				 */
+				folio_get(folio);
+				pte_unmap_unlock(vmf->pte, vmf->ptl);
+				vmf->pte = NULL;
+
+				if (named_swap_single_vma_mapping(vma))
+					same_file_count = 1;
+				else
+					same_file_count =
+						named_swap_same_file_pte_count(vma,
+									       vmf->address);
+
+				vmf->pte = pte_offset_map_lock(vma->vm_mm,
+							       vmf->pmd,
+							       vmf->address,
+							       &vmf->ptl);
+				if (!vmf->pte) {
+					folio_put(folio);
+					return VM_FAULT_NOPAGE;
+				}
+				if (!pte_same(ptep_get(vmf->pte), entry)) {
+					update_mmu_tlb(vma, vmf->address,
+						       vmf->pte);
+					pte_unmap_unlock(vmf->pte, vmf->ptl);
+					folio_put(folio);
+					return 0;
+				}
+				if (same_file_count == 1 &&
+				    folio_mapcount(folio) == 1) {
+					folio_put(folio);
+					return named_swap_wp_reuse(vmf, folio);
+				}
+
+				pte_unmap_unlock(vmf->pte, vmf->ptl);
+				vmf->pte = NULL;
+				vmf->vm_file = vma->vm_file;
+				mapcount = folio_mapcount(folio);
+				ret = do_cow_fault(vmf);
+				trace_named_swap_vmf_fault(vmf,
+							   NAMED_SWAP_FAULT_WP_COW,
+							   same_file_count,
+							   mapcount, ret);
+				return ret;
+			}
+
+			folio_get(folio);
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			vmf->pte = NULL;
+			vmf->vm_file = vma->vm_file;
+			mapcount = folio_mapcount(folio);
+			ret = do_cow_fault(vmf);
+			trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_WP_COW,
+						   0, mapcount, ret);
+			return ret;
+		} else if (likely(vmf->flags & FAULT_FLAG_WRITE)) {
+			entry = pte_mkdirty(entry);
+		}
+	}
+	entry = pte_mkyoung(entry);
+	if (ptep_set_access_flags(vma, vmf->address, vmf->pte, entry,
+				  vmf->flags & FAULT_FLAG_WRITE))
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+
+unlock:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	trace_named_swap_vmf_fault(vmf, NAMED_SWAP_FAULT_ACCESS, 0, 0, 0);
+	return 0;
 }
 
 int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
@@ -5883,6 +6447,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 			vmf->pte = NULL;
 		}
 	}
+	if (vma_is_named_swap(vmf->vma))
+		return do_named_swap_fault(vmf);
+
+	vmf->vm_file = vmf->vma->vm_file;
 
 	if (!vmf->pte)
 		return do_pte_missing(vmf);

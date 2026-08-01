@@ -53,6 +53,8 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/filemap.h>
+#undef CREATE_TRACE_POINTS
+#include <trace/events/named_swap.h>
 
 /*
  * FIXME: remove all knowledge of the buffer layer from the core VM
@@ -219,6 +221,10 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	struct address_space *mapping = folio->mapping;
 
 	trace_mm_filemap_delete_from_page_cache(folio);
+	if (mapping_named_swap(mapping))
+		trace_named_swap_cache_delete(mapping, folio->index,
+					      named_swap_mapping_index(mapping),
+					      folio_pfn(folio), folio_order(folio));
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
 }
@@ -329,6 +335,10 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 		struct folio *folio = fbatch->folios[i];
 
 		trace_mm_filemap_delete_from_page_cache(folio);
+		if (mapping_named_swap(mapping))
+			trace_named_swap_cache_delete(mapping, folio->index,
+					named_swap_mapping_index(mapping),
+					folio_pfn(folio), folio_order(folio));
 		filemap_unaccount_folio(mapping, folio);
 	}
 	page_cache_delete_batch(mapping, fbatch);
@@ -957,6 +967,11 @@ unlock:
 		goto error;
 
 	trace_mm_filemap_add_to_page_cache(folio);
+	if (mapping_named_swap(mapping))
+		trace_named_swap_cache_add(mapping, folio->index,
+					   named_swap_mapping_index(mapping),
+					   folio_pfn(folio), folio_order(folio),
+					   shadowp && *shadowp);
 	return 0;
 error:
 	folio->mapping = NULL;
@@ -971,6 +986,12 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 {
 	void *shadow = NULL;
 	int ret;
+
+	if (mapping_named_swap(mapping))
+		trace_named_swap_folio_alloc(mapping, index,
+					     named_swap_mapping_index(mapping),
+					     folio_pfn(folio), folio_order(folio),
+					     gfp);
 
 	ret = mem_cgroup_charge(folio, NULL, gfp);
 	if (ret)
@@ -991,8 +1012,9 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		 * get overwritten with something else, is a waste of memory.
 		 */
 		WARN_ON_ONCE(folio_test_active(folio));
-		if (!(gfp & __GFP_WRITE) && shadow)
+		if (!(gfp & __GFP_WRITE) && shadow){
 			workingset_refault(folio, shadow);
+		}
 		folio_add_lru(folio);
 	}
 	return ret;
@@ -1518,11 +1540,18 @@ EXPORT_SYMBOL(folio_unlock);
 void folio_end_read(struct folio *folio, bool success)
 {
 	unsigned long mask = 1 << PG_locked;
+	struct address_space *mapping = folio->mapping;
 
 	/* Must be in bottom byte for x86 to work */
 	BUILD_BUG_ON(PG_uptodate > 7);
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(success && folio_test_uptodate(folio), folio);
+
+	if (mapping && mapping_named_swap(mapping))
+		trace_named_swap_folio_uptodate(mapping, folio->index,
+					named_swap_mapping_index(mapping),
+					folio_pfn(folio), folio_order(folio),
+					success);
 
 	if (likely(success))
 		mask |= 1 << PG_uptodate;
@@ -3200,7 +3229,7 @@ static int lock_folio_maybe_drop_mmap(struct vm_fault *vmf, struct folio *folio,
  */
 static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 {
-	struct file *file = vmf->vma->vm_file;
+	struct file *file = vmf->vm_file;
 	struct file_ra_state *ra = &file->f_ra;
 	struct address_space *mapping = file->f_mapping;
 	DEFINE_READAHEAD(ractl, file, ra, mapping, vmf->pgoff);
@@ -3234,6 +3263,12 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 
 	if (vm_flags & VM_SEQ_READ) {
 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+		if (mapping_named_swap(mapping))
+			trace_named_swap_ra_window(mapping,
+				named_swap_mapping_index(mapping),
+				NAMED_SWAP_RA_MMAP_SEQ, vmf->pgoff,
+				ra->ra_pages, 0, ra->ra_pages, ra->ra_pages,
+				vmf->pgoff, READ_ONCE(ra->mmap_miss));
 		page_cache_sync_ra(&ractl, ra->ra_pages);
 		return fpin;
 	}
@@ -3258,6 +3293,12 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	ra->size = ra->ra_pages;
 	ra->async_size = ra->ra_pages / 4;
 	ractl._index = ra->start;
+	if (mapping_named_swap(mapping))
+		trace_named_swap_ra_window(mapping,
+			named_swap_mapping_index(mapping),
+			NAMED_SWAP_RA_MMAP_AROUND, ra->start, ra->size,
+			ra->async_size, ra->ra_pages, ra->ra_pages,
+			vmf->pgoff, mmap_miss);
 	page_cache_ra_order(&ractl, ra, 0);
 	return fpin;
 }
@@ -3270,7 +3311,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 					    struct folio *folio)
 {
-	struct file *file = vmf->vma->vm_file;
+	struct file *file = vmf->vm_file;
 	struct file_ra_state *ra = &file->f_ra;
 	DEFINE_READAHEAD(ractl, file, ra, file->f_mapping, vmf->pgoff);
 	struct file *fpin = NULL;
@@ -3286,6 +3327,7 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 
 	if (folio_test_readahead(folio)) {
 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+		/* page_cache_async_ra emits named_swap_ra_window */
 		page_cache_async_ra(&ractl, folio, ra->ra_pages);
 	}
 	return fpin;
@@ -3360,7 +3402,7 @@ static vm_fault_t filemap_fault_recheck_pte_none(struct vm_fault *vmf)
 vm_fault_t filemap_fault(struct vm_fault *vmf)
 {
 	int error;
-	struct file *file = vmf->vma->vm_file;
+	struct file *file = vmf->vm_file;
 	struct file *fpin = NULL;
 	struct address_space *mapping = file->f_mapping;
 	struct inode *inode = mapping->host;
@@ -3368,10 +3410,20 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	struct folio *folio;
 	vm_fault_t ret = 0;
 	bool mapping_locked = false;
+	bool named_swap = mapping_named_swap(mapping);
+	u64 named_swap_index = NAMED_SWAP_INDEX_NONE;
+
+	if (named_swap)
+		named_swap_file_index(file, &named_swap_index);
 
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-	if (unlikely(index >= max_idx))
+	if (unlikely(index >= max_idx)) {
+		if (named_swap)
+			trace_named_swap_filemap_lookup(mapping, index,
+							named_swap_index, false,
+							false);
 		return VM_FAULT_SIGBUS;
+	}
 
 	trace_mm_filemap_fault(mapping, index);
 
@@ -3379,6 +3431,11 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	 * Do we have something in the page cache already?
 	 */
 	folio = filemap_get_folio(mapping, index);
+	if (named_swap)
+		trace_named_swap_filemap_lookup(mapping, index, named_swap_index,
+						!IS_ERR(folio),
+						!IS_ERR(folio) &&
+						folio_test_uptodate(folio));
 	if (likely(!IS_ERR(folio))) {
 		/*
 		 * We found the page, so try async readahead before waiting for
@@ -3591,10 +3648,22 @@ skip:
  * Map page range [start_page, start_page + nr_pages) of folio.
  * start_page is gotten from start by folio_page(folio, start)
  */
+static bool filemap_map_pte_allowed(pte_t pte, bool named_swap,
+				    u64 named_swap_index)
+{
+	if (pte_none(pte))
+		return true;
+	if (!named_swap || !is_named_swap_pte(pte))
+		return false;
+	return named_swap_entry_index(pte_to_swp_entry(pte)) ==
+	       named_swap_index;
+}
+
 static vm_fault_t filemap_map_folio_range(struct vm_fault *vmf,
 			struct folio *folio, unsigned long start,
 			unsigned long addr, unsigned int nr_pages,
-			unsigned long *rss, unsigned int *mmap_miss)
+			unsigned long *rss, unsigned int *mmap_miss,
+			bool named_swap, u64 named_swap_index)
 {
 	vm_fault_t ret = 0;
 	struct page *page = folio_page(folio, start);
@@ -3620,7 +3689,8 @@ static vm_fault_t filemap_map_folio_range(struct vm_fault *vmf,
 		 * handled in the specific fault path, and it'll prohibit the
 		 * fault-around logic.
 		 */
-		if (!pte_none(ptep_get(&vmf->pte[count])))
+		if (!filemap_map_pte_allowed(ptep_get(&vmf->pte[count]),
+					     named_swap, named_swap_index))
 			goto skip;
 
 		count++;
@@ -3656,7 +3726,8 @@ skip:
 
 static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 		struct folio *folio, unsigned long addr,
-		unsigned long *rss, unsigned int *mmap_miss)
+		unsigned long *rss, unsigned int *mmap_miss,
+		bool named_swap, u64 named_swap_index)
 {
 	vm_fault_t ret = 0;
 	struct page *page = &folio->page;
@@ -3673,7 +3744,8 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 	 * handled in the specific fault path, and it'll prohibit
 	 * the fault-around logic.
 	 */
-	if (!pte_none(ptep_get(vmf->pte)))
+	if (!filemap_map_pte_allowed(ptep_get(vmf->pte),
+				     named_swap, named_swap_index))
 		return ret;
 
 	if (vmf->address == addr)
@@ -3690,7 +3762,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 			     pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
 	struct vm_area_struct *vma = vmf->vma;
-	struct file *file = vma->vm_file;
+	struct file *file = vmf->vm_file ? vmf->vm_file : vma->vm_file;
 	struct address_space *mapping = file->f_mapping;
 	pgoff_t file_end, last_pgoff = start_pgoff;
 	unsigned long addr;
@@ -3699,6 +3771,11 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	vm_fault_t ret = 0;
 	unsigned long rss = 0;
 	unsigned int nr_pages = 0, mmap_miss = 0, mmap_miss_saved, folio_type;
+	bool named_swap = mapping_named_swap(mapping);
+	u64 named_swap_index = NAMED_SWAP_INDEX_NONE;
+
+	if (named_swap && named_swap_file_index(file, &named_swap_index))
+		named_swap = false;
 
 	rcu_read_lock();
 	folio = next_uptodate_folio(&xas, mapping, end_pgoff);
@@ -3734,11 +3811,13 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 
 		if (!folio_test_large(folio))
 			ret |= filemap_map_order0_folio(vmf,
-					folio, addr, &rss, &mmap_miss);
+					folio, addr, &rss, &mmap_miss,
+					named_swap, named_swap_index);
 		else
 			ret |= filemap_map_folio_range(vmf, folio,
 					xas.xa_index - folio->index, addr,
-					nr_pages, &rss, &mmap_miss);
+					nr_pages, &rss, &mmap_miss,
+					named_swap, named_swap_index);
 
 		folio_unlock(folio);
 		folio_put(folio);
@@ -3761,12 +3840,12 @@ EXPORT_SYMBOL(filemap_map_pages);
 
 vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf)
 {
-	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+	struct address_space *mapping = vmf->vm_file->f_mapping;
 	struct folio *folio = page_folio(vmf->page);
 	vm_fault_t ret = VM_FAULT_LOCKED;
 
 	sb_start_pagefault(mapping->host->i_sb);
-	file_update_time(vmf->vma->vm_file);
+	file_update_time(vmf->vm_file);
 	folio_lock(folio);
 	if (folio->mapping != mapping) {
 		folio_unlock(folio);

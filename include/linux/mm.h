@@ -949,6 +949,8 @@ struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag);
 char *named_swap_file_path(struct file *file, char *buf, int buflen);
 void named_swap_link(struct vm_area_struct *vma);
 void named_swap_unlink(struct anon_vma *anon_vma);
+struct anon_vma *named_swap_claim_anon_vma(struct file *file,
+					   struct anon_vma *allocated);
 int named_swap_file_index(struct file *file, u64 *index);
 u64 named_swap_mapping_index(struct address_space *mapping);
 bool named_swap_single_vma_mapping(struct vm_area_struct *vma);

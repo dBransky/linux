@@ -6148,6 +6148,9 @@ vm_fault_t ext4_page_mkwrite(struct vm_fault *vmf)
 	vm_fault_t ret;
 	struct file *file = vma->vm_file;
 	struct inode *inode = file_inode(file);
+	if (vma_is_named_swap(vma)) {
+		inode = file->f_mapping->host;
+	}
 	struct address_space *mapping = inode->i_mapping;
 	handle_t *handle;
 	get_block_t *get_block;

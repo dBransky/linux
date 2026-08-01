@@ -2608,6 +2608,12 @@ int block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
 {
 	struct folio *folio = page_folio(vmf->page);
 	struct inode *inode = file_inode(vma->vm_file);
+	if (vma_is_named_swap(vma)) {
+		//TODO: what if its a different file? read the file from the folio not the vma
+		VM_BUG_ON_FOLIO(folio_test_anon(folio), folio);
+		inode = vma->vm_file->f_mapping->host;
+	}
+
 	unsigned long end;
 	loff_t size;
 	int ret;

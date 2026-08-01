@@ -1173,6 +1173,36 @@ struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag) {
  * in named_swap_file (wrapper private_data).  Safe in page faults.
  * Call after anon_vma_prepare(); may take get_file() on first link.
  */
+
+/*
+ * One named-swap file mapping <-> one anon_vma. The first creator
+ * publishes allocated; later faults adopt the winner.
+ */
+struct anon_vma *named_swap_claim_anon_vma(struct file *file,
+					   struct anon_vma *allocated)
+{
+	struct named_swap_file *ns;
+	struct address_space *mapping;
+	struct anon_vma *existing;
+
+	if (!file || !mapping_named_swap(file->f_mapping))
+		return allocated;
+
+	ns = file->private_data;
+	mapping = file->f_mapping;
+	if (!ns)
+		return allocated;
+
+	spin_lock(&ns->bind_lock);
+	existing = mapping->anon_vma;
+	if (!existing && allocated) {
+		mapping->anon_vma = allocated;
+		existing = allocated;
+	}
+	spin_unlock(&ns->bind_lock);
+	return existing;
+}
+
 void named_swap_link(struct vm_area_struct *vma)
 {
 	struct file *file = vma->vm_file;
