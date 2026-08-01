@@ -183,6 +183,9 @@ static void __vma_link_file(struct vm_area_struct *vma,
 	if (vma_is_shared_maywrite(vma))
 		mapping_allow_writable(mapping);
 
+	if (mapping_named_swap(mapping))
+		return;
+
 	flush_dcache_mmap_lock(mapping);
 	vma_interval_tree_insert(vma, &mapping->i_mmap);
 	flush_dcache_mmap_unlock(mapping);
@@ -267,7 +270,7 @@ static void vma_prepare(struct vma_prepare *vp)
 			anon_vma_interval_tree_pre_update_vma(vp->adj_next);
 	}
 
-	if (vp->file) {
+	if (vp->file && !mapping_named_swap(vp->mapping)) {
 		flush_dcache_mmap_lock(vp->mapping);
 		vma_interval_tree_remove(vp->vma, &vp->mapping->i_mmap);
 		if (vp->adj_next)
@@ -288,7 +291,7 @@ static void vma_prepare(struct vma_prepare *vp)
 static void vma_complete(struct vma_prepare *vp, struct vma_iterator *vmi,
 			 struct mm_struct *mm)
 {
-	if (vp->file) {
+	if (vp->file && !(mapping_named_swap(vp->mapping))) {
 		if (vp->adj_next)
 			vma_interval_tree_insert(vp->adj_next,
 						 &vp->mapping->i_mmap);
@@ -1666,6 +1669,9 @@ void unlink_file_vma(struct vm_area_struct *vma)
 	if (file) {
 		struct address_space *mapping = file->f_mapping;
 
+		if (mapping_named_swap(mapping))
+			return;
+
 		i_mmap_lock_write(mapping);
 		__remove_shared_vm_struct(vma, mapping);
 		i_mmap_unlock_write(mapping);
@@ -1679,6 +1685,9 @@ void vma_link_file(struct vm_area_struct *vma)
 
 	if (file) {
 		mapping = file->f_mapping;
+		if (mapping_named_swap(mapping))
+			return;
+
 		i_mmap_lock_write(mapping);
 		__vma_link_file(vma, mapping);
 		i_mmap_unlock_write(mapping);
@@ -2362,6 +2371,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 		error = shmem_zero_setup(vma);
 	else
 		vma_set_anonymous(vma);
+
 
 	if (error)
 		goto free_iter_vma;

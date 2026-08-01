@@ -23,6 +23,7 @@
 #include <linux/processor.h>
 #include <linux/sizes.h>
 #include <linux/compat.h>
+#include <linux/fs.h>
 #include <linux/fsnotify.h>
 
 #include <linux/uaccess.h>
@@ -567,17 +568,28 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 	unsigned long ret;
 	struct mm_struct *mm = current->mm;
 	unsigned long populate;
+	struct file *named_swap_file = NULL;
 	LIST_HEAD(uf);
 
 	ret = security_mmap_file(file, prot, flag);
 	if (!ret)
 		ret = fsnotify_mmap_perm(file, prot, pgoff >> PAGE_SHIFT, len);
 	if (!ret) {
-		if (mmap_write_lock_killable(mm))
+		// if (!file && ((len >> PAGE_SHIFT) >= named_swap_min_vma_size || (flag & MAP_NAMED_SWAP)))
+		if (!file && (flag & MAP_NAMED_SWAP)) {
+			file = named_swap_prepare_mmap(len, &flag);
+			named_swap_file = file;
+		}
+		if (mmap_write_lock_killable(mm)) {
+			if (named_swap_file)
+				fput(named_swap_file);
 			return -EINTR;
+		}
 		ret = do_mmap(file, addr, len, prot, flag, 0, pgoff, &populate,
 			      &uf);
 		mmap_write_unlock(mm);
+		if (named_swap_file)
+			fput(named_swap_file);
 		userfaultfd_unmap_complete(mm, &uf);
 		if (populate)
 			mm_populate(ret, populate);
@@ -830,10 +842,19 @@ EXPORT_SYMBOL(vcalloc_noprof);
 struct anon_vma *folio_anon_vma(const struct folio *folio)
 {
 	unsigned long mapping = (unsigned long)folio->mapping;
+	struct address_space *mapping_ptr;
 
-	if ((mapping & PAGE_MAPPING_FLAGS) != PAGE_MAPPING_ANON)
+	if ((mapping & PAGE_MAPPING_FLAGS) == PAGE_MAPPING_ANON)
+		return (void *)(mapping - PAGE_MAPPING_ANON);
+
+	if (mapping & PAGE_MAPPING_FLAGS || !mapping)
 		return NULL;
-	return (void *)(mapping - PAGE_MAPPING_ANON);
+
+	mapping_ptr = (struct address_space *)mapping;
+	if (mapping_named_swap(mapping_ptr))
+		return mapping_ptr->anon_vma;
+
+	return NULL;
 }
 
 /**
@@ -990,7 +1011,7 @@ unsigned long vm_commit_limit(void)
 	else
 		allowed = ((totalram_pages() - hugetlb_total_pages())
 			   * sysctl_overcommit_ratio / 100);
-	allowed += total_swap_pages;
+	allowed += total_swap_pages + named_swap_total_pages();
 
 	return allowed;
 }
@@ -1050,7 +1071,8 @@ int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
 		return 0;
 
 	if (sysctl_overcommit_memory == OVERCOMMIT_GUESS) {
-		if (pages > totalram_pages() + total_swap_pages)
+		if (pages > totalram_pages() + total_swap_pages +
+		    named_swap_total_pages())
 			goto error;
 		return 0;
 	}
