@@ -1,0 +1,170 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Multi-Generational LRU (MGLRU) Tracing Script - Revised
+ * 
+ * This script focuses on traceable MGLRU functions and uses tracepoints
+ * where kprobes are not available due to inlining.
+ * 
+ * Usage: sudo bpftrace mglru_trace.bt
+ */
+
+
+kprobe:do_swap_page {
+    $vmf = (struct vm_fault *)arg0;
+    $vma = (struct vm_area_struct *)$vmf->vma;
+    $vir_addr = (uint64)$vmf->real_address;
+    printf("do_swap_page: %llu 0x%lx\n", nsecs(monotonic), $vir_addr);
+}
+
+kprobe:try_to_unmap_one {
+    $folio = (struct folio *)arg0;
+    $folio_index = (uint64)($folio->index);
+    $vma = (struct vm_area_struct *)arg1;
+    $vma_start = (uint64)($vma->vm_start);
+    $val = (uint64)$folio->private;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    $virtual_addr = $vma_start + (($folio_index - $vma->vm_pgoff) << 12);
+    printf("try_to_unmap_one: %llu %p 0x%lx 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $folio , $virtual_addr,$val, $offset, $type);
+}
+
+/* Core MGLRU Generation Management (Available functions) */
+
+// Track generation increments (aging process)
+kprobe:inc_max_seq {
+    $lruvec = (struct lruvec *)arg0;
+    $seq = arg1;
+    $swappiness = arg2;
+    
+    printf("[%llu ns] %-20s seq=%lu swappiness=%d\n", 
+           nsecs(monotonic), "inc_max_seq", $seq, $swappiness);
+}
+
+kretprobe:inc_max_seq {
+    $success = retval;
+    if ($success) {
+        printf("[%llu ns] %-20s SUCCESS - New generation created\n", 
+               nsecs(monotonic), "inc_max_seq");
+        @gen_increments = @gen_increments + 1;
+    }
+}
+
+// Track eviction attempts  
+kprobe:evict_folios {
+    $lruvec = (struct lruvec *)arg0;
+    $sc = (struct scan_control *)arg1;
+    $swappiness = arg2;
+    
+    printf("[%llu ns] %-20s swappiness=%d\n", 
+           nsecs(monotonic), "evict_folios", $swappiness);
+}
+
+kretprobe:evict_folios {
+    $scanned = retval;
+    printf("[%llu ns] %-20s pages_scanned=%d\n", 
+           nsecs(monotonic), "ret:evict_folios", $scanned);
+    @pages_scanned = @pages_scanned + $scanned;
+}
+
+// Track main MGLRU shrink operations
+kprobe:shrink_lruvec {
+    $lruvec = (struct lruvec *)arg0;
+    $sc = (struct scan_control *)arg1;
+    
+    printf("[%llu ns] %-20s priority=%d nr_to_reclaim=%lu\n", 
+           nsecs(monotonic), "shrink_lruvec", 
+           $sc->priority, $sc->nr_to_reclaim);
+}
+
+kprobe:folio_inc_gen {
+    $folio = (struct folio*)arg1;
+    printf("[%llu ns] %-20s folio=%p\n", nsecs(monotonic), "folio_inc_gen", $folio);
+
+}
+kretprobe:folio_inc_gen {
+    $new_gen = retval;
+    printf("[%llu ns] %-20s new_gen=%d\n", nsecs(monotonic), "ret:folio_inc_gen", $new_gen);
+
+}
+
+kretprobe:isolate_folios {
+    $scanned = retval;
+    printf("[%llu ns] %-20s scanned=%d\n", nsecs(monotonic), "isolate_folios", $scanned);
+
+}
+
+kprobe:walk_update_folio {
+    $new_gen = (int32)arg2;
+    $folio = (struct folio*)arg1;
+    if ($folio != 0) {
+        printf("[%llu ns] %-20s folio=%p new_gen=%d\n", nsecs(monotonic), "walk_update_folio", $folio, $new_gen);
+    }
+}
+
+/* Use VM tracepoints for detailed reclaim information */
+
+// Track when pages are scanned
+tracepoint:vmscan:mm_vmscan_lru_isolate {
+    if (args->lru == 0 || args->lru == 1) { // ANON pages
+        printf("[%llu ns] %-20s type=ANON scanned=%lu isolated=%lu\n",
+               nsecs(monotonic), "mm_vmscan_lru_isolate", 
+               args->nr_scanned, args->nr_taken);
+    } else { // FILE pages  
+        printf("[%llu ns] %-20s type=FILE scanned=%lu isolated=%lu\n",
+               nsecs(monotonic), "mm_vmscan_lru_isolate", 
+               args->nr_scanned, args->nr_taken);
+    }
+    @total_scanned = @total_scanned + args->nr_scanned;
+    @total_isolated = @total_isolated + args->nr_taken;
+}
+
+// Track when pages are reclaimed
+tracepoint:vmscan:mm_vmscan_lru_shrink_inactive {
+    printf("[%llu ns] %-20s node=%d scanned=%lu reclaimed=%lu priority=%lu reclaim_flags=0x%lx\n",
+           nsecs(monotonic), "mm_vmscan_lru_shrink_inactive",
+           args->nid, args->nr_scanned, args->nr_reclaimed, args->priority, args->reclaim_flags);
+}
+
+// Track direct reclaim events
+tracepoint:vmscan:mm_vmscan_direct_reclaim_begin {
+    printf("[%llu ns] %-20s order=%d\n",
+           nsecs(monotonic), "mm_vmscan_direct_reclaim_begin", 
+           args->order);
+    @direct_reclaim_events = @direct_reclaim_events + 1;
+}
+
+tracepoint:vmscan:mm_vmscan_direct_reclaim_end {
+    printf("[%llu ns] %-20s reclaimed=%lu\n",
+           nsecs(monotonic), "mm_vmscan_direct_reclaim_end", 
+           args->nr_reclaimed);
+}
+
+// Track kswapd activity
+tracepoint:vmscan:mm_vmscan_kswapd_wake {
+    printf("[%llu ns] %-20s node=%d order=%d\n",
+           nsecs(monotonic), "mm_vmscan_kswapd_wake",
+           args->nid, args->order);
+    @kswapd_wakes = @kswapd_wakes + 1;
+}
+
+tracepoint:vmscan:mm_vmscan_kswapd_sleep {
+    printf("[%llu ns] %-20s node=%d\n",
+           nsecs(monotonic), "mm_vmscan_kswapd_sleep", args->nid);
+}
+
+// Track writeback events (memory pressure indicator)
+tracepoint:vmscan:mm_vmscan_write_folio {
+    printf("[%llu ns] %-20s pfn=%lu addr=%p\n", nsecs, "mm_vmscan_write_folio", args->pfn, (args->pfn) * 4096);
+}
+
+/* Memory pressure detection through allocation patterns */
+tracepoint:kmem:mm_page_alloc {
+    if (args->order > 0) {
+        @high_order_allocs = @high_order_allocs + 1;
+        if (@high_order_allocs % 100 == 0) {
+            printf("[%llu ns] %-20s order=%d (pressure indicator)\n",
+                   nsecs(monotonic), "mm_page_alloc", args->order);
+        }
+    }
+}

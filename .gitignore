@@ -10,7 +10,10 @@
 #
 # Normal rules (sorted alphabetically)
 #
+fs/
+drivers/
 .*
+*.out
 *.a
 *.asn1.[ch]
 *.bin
@@ -180,3 +183,8 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+image/
+vm1.qcow2
+vm2.qcow2
+vm.log
+vm.pid

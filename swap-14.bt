@@ -1,0 +1,98 @@
+#!/usr/bin/env bpftrace
+//#include <linux/mm_types.h>
+kprobe:add_to_swap_cache {
+    $page = (struct page *)arg0;
+    $val = (uint64)arg1;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    printf("add_to_swap_cache: %llu %p 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $page, $val, $offset, $type);
+}
+
+kprobe:try_to_unmap_one {
+    $folio = (struct folio *)arg0;
+    $folio_index = (uint64)($folio->index);
+    $vma = (struct vm_area_struct *)arg1;
+    $vma_start = (uint64)($vma->vm_start);
+    $val = (uint64)$folio->private;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    $virtual_addr = $vma_start + (($folio_index - $vma->vm_pgoff) << 12);
+    printf("try_to_unmap_one: %llu %p 0x%lx 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $folio , $virtual_addr,$val, $offset, $type);
+}
+
+kprobe:__swap_writepage {
+    $page = (struct page *)arg0;
+    $val = $page->private;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    printf("__swap_writepage: %llu %p 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $page, $val, $offset, $type);
+}
+
+kprobe:__remove_mapping {
+    $folio = (struct folio *)arg1;
+    printf("__remove_mapping: %llu %p \n", nsecs(monotonic), $folio);
+}
+kprobe:__try_to_reclaim_swap {
+    $folio = (struct folio *)arg1;
+    printf("__remove_mapping: %llu %p \n", nsecs(monotonic), $folio);
+}
+
+kprobe:__delete_from_swap_cache {
+    $folio = (struct folio *)arg0;
+    $val = (uint64)arg1;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    printf("__delete_from_swap_cache: %llu %p 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $folio, $val, $offset, $type);
+}
+
+kprobe:do_swap_page {
+    $vmf = (struct vm_fault *)arg0;
+    $vma = (struct vm_area_struct *)$vmf->vma;
+    $vir_addr = (uint64)$vmf->real_address;
+    printf("do_swap_page: %llu 0x%lx\n", nsecs(monotonic), $vir_addr);
+}
+
+kprobe:__read_swap_cache_async {
+    $val = (uint64)arg0;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    $vir_addr = (uint64)arg3;
+    printf("__read_swap_cache_async: %llu 0x%lx 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $vir_addr, $val, $offset, $type);
+}
+
+kprobe:swap_cluster_readahead {
+    $val = (uint64)arg0;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    $vmf = (struct vm_fault *)arg2;
+    $vma = (struct vm_area_struct *)$vmf->vma;
+    $vir_addr = (uint64)$vmf->real_address;
+    printf("swap_cluster_readahead: %llu 0x%lx 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $vir_addr, $val, $offset, $type);
+}
+kprobe:swap_vma_readahead {
+    $val = (uint64)arg0;
+    $offset = $val & ((1<<58)-1);
+    $type = ($val >> 58);
+    $vmf = (struct vm_fault *)arg2;
+    $vma = (struct vm_area_struct *)$vmf->vma;
+    $vir_addr = (uint64)$vmf->real_address;
+    printf("swap_vma_readahead: %llu 0x%lx 0x%lx 0x%lx 0x%lx\n", nsecs(monotonic), $vir_addr, $val, $offset, $type);
+}
+
+kprobe:madvise_collapse {
+    $vma = (struct vm_area_struct *)arg0;
+    $start = (uint64)arg2;
+    $end = (uint64)arg3;
+    printf("madvise_collapse: %llu %p 0x%lx 0x%lx\n", nsecs(monotonic), $vma, $start, $end);
+}
+kprobe:hpage_collapse_scan_pmd {
+    $vma = (struct vm_area_struct *)arg1;
+    printf("hpage_collapse_scan_pmd: %llu %p\n", nsecs(monotonic), $vma);
+}
+kprobe:hpage_collapse_scan_file {
+    $vma = (struct vm_area_struct *)arg1;
+    printf("hpage_collapse_scan_file: %llu %p\n", nsecs(monotonic), $vma);
+}
+kprobe:lru_add_drain_all {
+    printf("lru_add_drain_all: %llu\n", nsecs(monotonic));
+}
