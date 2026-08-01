@@ -1499,6 +1499,16 @@ static inline void shrinker_debugfs_remove(struct dentry *debugfs_entry,
 }
 #endif /* CONFIG_SHRINKER_DEBUG */
 
+/*
+ * Workingset shadow packing in page-cache xa_value entries (see workingset.c).
+ * Shared with named_swap mapcount overlay in i_pages shadows.
+ */
+#define WORKINGSET_SHIFT	1
+#define EVICTION_SHIFT		((BITS_PER_LONG - BITS_PER_XA_VALUE) + \
+				 WORKINGSET_SHIFT + NODES_SHIFT + \
+				 MEM_CGROUP_ID_SHIFT)
+#define EVICTION_MASK		(~0UL >> EVICTION_SHIFT)
+
 /* Only track the nodes of mappings with shadow entries */
 void workingset_update_node(struct xa_node *node);
 extern struct list_lru shadow_nodes;

@@ -70,6 +70,8 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
+#undef CREATE_TRACE_POINTS
+#include <trace/events/named_swap.h>
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -3437,6 +3439,7 @@ static void walk_update_folio(struct lru_gen_mm_walk *walk, struct folio *folio,
 		return;
 
 	if (dirty && !folio_test_dirty(folio) &&
+	    !folio_test_named_swap(folio) &&
 	    !(folio_test_anon(folio) && folio_test_swapbacked(folio) &&
 	      !folio_test_swapcache(folio)))
 		folio_mark_dirty(folio);
