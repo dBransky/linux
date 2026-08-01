@@ -365,7 +365,8 @@ static unsigned int __maybe_unused mm_ptr_to_hash(const void *ptr)
 	EM(MM_FILEPAGES)	\
 	EM(MM_ANONPAGES)	\
 	EM(MM_SWAPENTS)		\
-	EMe(MM_SHMEMPAGES)
+	EM(MM_SHMEMPAGES)	\
+	EMe(MM_NAMED_SWAPPAGES)
 
 #undef EM
 #undef EMe

@@ -85,6 +85,7 @@ TRACE_EVENT(mark_victim,
 		__field(unsigned long, anon_rss)
 		__field(unsigned long, file_rss)
 		__field(unsigned long, shmem_rss)
+		__field(unsigned long, named_swap_rss)
 		__field(uid_t, uid)
 		__field(unsigned long, pgtables)
 		__field(short, oom_score_adj)
@@ -97,18 +98,20 @@ TRACE_EVENT(mark_victim,
 		__entry->anon_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_ANONPAGES));
 		__entry->file_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_FILEPAGES));
 		__entry->shmem_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_SHMEMPAGES));
+		__entry->named_swap_rss = PG_COUNT_TO_KB(get_mm_counter(task->mm, MM_NAMED_SWAPPAGES));
 		__entry->uid = uid;
 		__entry->pgtables = mm_pgtables_bytes(task->mm) >> 10;
 		__entry->oom_score_adj = task->signal->oom_score_adj;
 	),
 
-	TP_printk("pid=%d comm=%s total-vm=%lukB anon-rss=%lukB file-rss:%lukB shmem-rss:%lukB uid=%u pgtables=%lukB oom_score_adj=%hd",
+	TP_printk("pid=%d comm=%s total-vm=%lukB anon-rss=%lukB file-rss:%lukB shmem-rss:%lukB named-swap-rss:%lukB uid=%u pgtables=%lukB oom_score_adj=%hd",
 		__entry->pid,
 		__get_str(comm),
 		__entry->total_vm,
 		__entry->anon_rss,
 		__entry->file_rss,
 		__entry->shmem_rss,
+		__entry->named_swap_rss,
 		__entry->uid,
 		__entry->pgtables,
 		__entry->oom_score_adj
