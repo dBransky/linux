@@ -131,6 +131,8 @@
 
 #include "internal.h"
 
+#include <trace/events/named_swap.h>
+
 /*
  * Initialise a struct file's readahead state.  Assumes that the caller has
  * memset *ra to zero.
@@ -151,6 +153,11 @@ static void read_pages(struct readahead_control *rac)
 
 	if (!readahead_count(rac))
 		return;
+
+	if (mapping_named_swap(rac->mapping))
+		trace_named_swap_ra_submit(rac->mapping, readahead_index(rac),
+					   named_swap_mapping_index(rac->mapping),
+					   readahead_count(rac));
 
 	if (unlikely(rac->_workingset))
 		psi_memstall_enter(&rac->_pflags);
@@ -209,6 +216,7 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 {
 	struct address_space *mapping = ractl->mapping;
 	unsigned long index = readahead_index(ractl);
+	unsigned long wanted_nr = nr_to_read;
 	gfp_t gfp_mask = readahead_gfp_mask(mapping);
 	unsigned long mark = ULONG_MAX, i = 0;
 	unsigned int min_nrpages = mapping_min_folio_nrpages(mapping);
@@ -224,6 +232,11 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 	 * gfp_mask, but let's be explicit here.
 	 */
 	unsigned int nofs = memalloc_nofs_save();
+
+	if (mapping_named_swap(mapping))
+		trace_named_swap_readahead(mapping, index,
+					  named_swap_mapping_index(mapping),
+					  nr_to_read, lookahead_size);
 
 	filemap_invalidate_lock_shared(mapping);
 	index = mapping_align_index(mapping, index);
@@ -261,6 +274,11 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 			 * have a stable reference to this page, and it's
 			 * not worth getting one just for that.
 			 */
+			if (mapping_named_swap(mapping) && readahead_count(ractl))
+				trace_named_swap_ra_hole(mapping, index,
+					index + i,
+					named_swap_mapping_index(mapping),
+					readahead_count(ractl), wanted_nr);
 			read_pages(ractl);
 			ractl->_index += min_nrpages;
 			i = ractl->_index + ractl->_nr_pages - index;
@@ -556,6 +574,9 @@ void page_cache_sync_ra(struct readahead_control *ractl,
 	struct file_ra_state *ra = ractl->ra;
 	unsigned long max_pages, contig_count;
 	pgoff_t prev_index, miss;
+	bool named_swap = mapping_named_swap(ractl->mapping);
+	u64 ns_index = named_swap ? named_swap_mapping_index(ractl->mapping)
+				  : NAMED_SWAP_INDEX_NONE;
 
 	/*
 	 * Even if readahead is disabled, issue this request as readahead
@@ -588,6 +609,11 @@ void page_cache_sync_ra(struct readahead_control *ractl,
 		ra->size = get_init_ra_size(req_count, max_pages);
 		ra->async_size = ra->size > req_count ? ra->size - req_count :
 							ra->size >> 1;
+		if (named_swap)
+			trace_named_swap_ra_window(ractl->mapping, ns_index,
+				NAMED_SWAP_RA_SYNC_INIT, ra->start, ra->size,
+				ra->async_size, ra->ra_pages, req_count,
+				prev_index, 0);
 		goto readit;
 	}
 
@@ -604,6 +630,10 @@ void page_cache_sync_ra(struct readahead_control *ractl,
 	 * readahead state.
 	 */
 	if (contig_count <= req_count) {
+		if (named_swap)
+			trace_named_swap_ra_window(ractl->mapping, ns_index,
+				NAMED_SWAP_RA_SYNC_SMALL, index, req_count, 0,
+				ra->ra_pages, req_count, contig_count, 0);
 		do_page_cache_ra(ractl, req_count, 0);
 		return;
 	}
@@ -616,6 +646,11 @@ void page_cache_sync_ra(struct readahead_control *ractl,
 	ra->start = index;
 	ra->size = min(contig_count + req_count, max_pages);
 	ra->async_size = 1;
+	if (named_swap)
+		trace_named_swap_ra_window(ractl->mapping, ns_index,
+			NAMED_SWAP_RA_SYNC_HISTORY, ra->start, ra->size,
+			ra->async_size, ra->ra_pages, req_count, contig_count,
+			0);
 readit:
 	ractl->_index = ra->start;
 	page_cache_ra_order(ractl, ra, 0);
@@ -630,6 +665,9 @@ void page_cache_async_ra(struct readahead_control *ractl,
 	pgoff_t index = readahead_index(ractl);
 	pgoff_t expected, start;
 	unsigned int order = folio_order(folio);
+	bool named_swap = mapping_named_swap(ractl->mapping);
+	u64 ns_index = named_swap ? named_swap_mapping_index(ractl->mapping)
+				  : NAMED_SWAP_INDEX_NONE;
 
 	/* no readahead */
 	if (!ra->ra_pages)
@@ -661,6 +699,11 @@ void page_cache_async_ra(struct readahead_control *ractl,
 		 */
 		ra->size = max(ra->size, get_next_ra_size(ra, max_pages));
 		ra->async_size = ra->size;
+		if (named_swap)
+			trace_named_swap_ra_window(ractl->mapping, ns_index,
+				NAMED_SWAP_RA_ASYNC_HIT, ra->start, ra->size,
+				ra->async_size, ra->ra_pages, req_count,
+				expected, 0);
 		goto readit;
 	}
 
@@ -682,6 +725,10 @@ void page_cache_async_ra(struct readahead_control *ractl,
 	ra->size += req_count;
 	ra->size = get_next_ra_size(ra, max_pages);
 	ra->async_size = ra->size;
+	if (named_swap)
+		trace_named_swap_ra_window(ractl->mapping, ns_index,
+			NAMED_SWAP_RA_ASYNC_INTERLEAVED, ra->start, ra->size,
+			ra->async_size, ra->ra_pages, req_count, expected, 0);
 readit:
 	ractl->_index = ra->start;
 	page_cache_ra_order(ractl, ra, order);

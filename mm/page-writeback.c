@@ -39,6 +39,7 @@
 #include <linux/sched/signal.h>
 #include <linux/mm_inline.h>
 #include <trace/events/writeback.h>
+#include <trace/events/named_swap.h>
 
 #include "internal.h"
 
@@ -1830,9 +1831,41 @@ static void balance_wb_limits(struct dirty_throttle_control *dtc,
  * the caller to wait once crossing the (background_thresh + dirty_thresh) / 2.
  * If we're over `background_thresh' then the writeback threads are woken to
  * perform some writeout.
+ *
+ * @mapping is optional; when it is a named-swap mapping, throttle decisions
+ * are also emitted on named_swap_balance_dirty.
  */
+static void named_swap_trace_balance_dirty(struct address_space *mapping,
+		struct bdi_writeback *wb, struct dirty_throttle_control *dtc,
+		unsigned long dirty_ratelimit, unsigned long task_ratelimit,
+		unsigned long pages_dirtied, long pause, bool freerun)
+{
+	unsigned int flags = 0;
+
+	if (!mapping || !mapping_named_swap(mapping))
+		return;
+
+	if (freerun)
+		flags |= 1;
+	if (wb->dirty_exceeded)
+		flags |= 2;
+
+	trace_named_swap_balance_dirty(mapping,
+				       named_swap_mapping_index(mapping),
+				       dtc ? dtc->thresh : 0,
+				       dtc ? dtc->bg_thresh : 0,
+				       dtc ? dtc->dirty : 0,
+				       dtc ? dtc->wb_thresh : 0,
+				       dtc ? dtc->wb_dirty : 0,
+				       dirty_ratelimit, task_ratelimit,
+				       pages_dirtied,
+				       pause * 1000 / HZ,
+				       flags);
+}
+
 static int balance_dirty_pages(struct bdi_writeback *wb,
-			       unsigned long pages_dirtied, unsigned int flags)
+			       unsigned long pages_dirtied, unsigned int flags,
+			       struct address_space *mapping)
 {
 	struct dirty_throttle_control gdtc_stor = { GDTC_INIT(wb) };
 	struct dirty_throttle_control mdtc_stor = { MDTC_INIT(wb, &gdtc_stor) };
@@ -1897,6 +1930,8 @@ free_running:
 			if (mdtc)
 				m_intv = domain_poll_intv(mdtc, strictlimit);
 			current->nr_dirtied_pause = min(intv, m_intv);
+			named_swap_trace_balance_dirty(mapping, wb, gdtc, 0, 0,
+						       pages_dirtied, 0, true);
 			break;
 		}
 
@@ -1973,6 +2008,11 @@ free_running:
 						  period,
 						  min(pause, 0L),
 						  start_time);
+			named_swap_trace_balance_dirty(mapping, wb, sdtc,
+						       dirty_ratelimit,
+						       task_ratelimit,
+						       pages_dirtied,
+						       min(pause, 0L), false);
 			if (pause < -HZ) {
 				current->dirty_paused_when = now;
 				current->nr_dirtied = 0;
@@ -2002,6 +2042,9 @@ pause:
 					  period,
 					  pause,
 					  start_time);
+		named_swap_trace_balance_dirty(mapping, wb, sdtc,
+					       dirty_ratelimit, task_ratelimit,
+					       pages_dirtied, pause, false);
 		if (flags & BDP_ASYNC) {
 			ret = -EAGAIN;
 			break;
@@ -2126,7 +2169,8 @@ int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
 	preempt_enable();
 
 	if (unlikely(current->nr_dirtied >= ratelimit))
-		ret = balance_dirty_pages(wb, current->nr_dirtied, flags);
+		ret = balance_dirty_pages(wb, current->nr_dirtied, flags,
+					  mapping);
 
 	wb_put(wb);
 	return ret;
@@ -3150,6 +3194,16 @@ void __folio_start_writeback(struct folio *folio, bool keep_write)
 
 	lruvec_stat_mod_folio(folio, NR_WRITEBACK, nr);
 	zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, nr);
+
+	if (mapping && mapping_named_swap(mapping)) {
+		enum named_swap_wb_reason reason = NAMED_SWAP_WB_FLUSHER;
+
+		if (current_is_kswapd() || (current->flags & PF_MEMALLOC))
+			reason = NAMED_SWAP_WB_RECLAIM;
+		trace_named_swap_writeback(mapping, folio_index(folio),
+					   folio_pfn(folio), folio_order(folio),
+					   folio_mapcount(folio), reason, 0);
+	}
 
 	access_ret = arch_make_folio_accessible(folio);
 	/*

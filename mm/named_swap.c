@@ -56,13 +56,6 @@ struct named_swap_file {
 static DEFINE_XARRAY(named_swap_files);
 static DEFINE_MUTEX(named_swap_xa_lock);
 
-enum named_swap_resize_op {
-	NAMED_SWAP_RESIZE_ENLARGE,
-	NAMED_SWAP_RESIZE_SHRINK,
-	NAMED_SWAP_RESIZE_DEALLOC,
-	NAMED_SWAP_RESIZE_UNCOMMIT,
-	NAMED_SWAP_RESIZE_ALLOC,
-};
 
 int named_swap_debug = NAMED_SWAP_DBG_HIST | NAMED_SWAP_DBG_SEGV |
 		       NAMED_SWAP_DBG_ASSERT;
@@ -141,6 +134,9 @@ static void named_swap_hist_record(struct vm_area_struct *vma,
 
 	if (!vma)
 		return;
+
+	trace_named_swap_resize(vma, op, addr, delta, old_size, new_size,
+				index, ret);
 
 	if (named_swap_debug & NAMED_SWAP_DBG_PRINT)
 		pr_info("named_swap %s pid=%d comm=%s vma=%lx-%lx flags=%lx pgoff=%lx addr=%lx delta=%lu old=%lld new=%lld index=%llu ret=%d\n",
@@ -340,6 +336,7 @@ void named_swap_debug_user_segv(struct pt_regs *regs, unsigned long address,
 	ip = instruction_pointer(regs);
 	if (vma)
 		index = named_swap_vma_index(vma);
+	trace_named_swap_user_segv(address, ip, error_code, si_code, vma, index);
 
 	pr_err("named_swap SEGV #%d pid=%d tgid=%d comm=%s addr=%lx ip=%lx err=0x%lx si=%d index=%llu\n",
 	       dump_n, current->pid, current->tgid, current->comm,
