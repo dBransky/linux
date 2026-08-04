@@ -40,6 +40,8 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/named_swap.h>
 #undef CREATE_TRACE_POINTS
+#include <linux/mm_inline.h>
+#include <linux/memcontrol.h>
 #include "internal.h"
 
 /*
@@ -1283,4 +1285,142 @@ void named_swap_unlink(struct anon_vma *anon_vma)
 	} else {
 		spin_unlock(&ns->bind_lock);
 	}
+}
+
+/*
+ * Clean sequential reclaim helpers (see named_swap_seq_* traces).
+ * Walk mapping->i_pages contiguously; only clean isolatable folios.
+ */
+struct named_swap_reclaim_stream {
+	struct address_space *mapping;
+	spinlock_t lock;
+	pgoff_t window_start;
+	pgoff_t window_end;
+	unsigned int ahead_size;
+	unsigned int isolated;
+	void *stream_cookie;
+	unsigned int seq_hits;
+};
+
+enum named_swap_seq_stop
+named_swap_seq_classify(struct folio *folio, struct lruvec *lruvec,
+			int type, int zone, int gen)
+{
+	if (!folio)
+		return NAMED_SWAP_SEQ_NO_ENTRY;
+	if (!folio_ref_count(folio))
+		return NAMED_SWAP_SEQ_MAPPING_GONE;
+	if (!folio_test_named_swap(folio))
+		return NAMED_SWAP_SEQ_MAPPING_GONE;
+	if (folio_test_dirty(folio))
+		return NAMED_SWAP_SEQ_DIRTY;
+	if (folio_test_writeback(folio))
+		return NAMED_SWAP_SEQ_WRITEBACK;
+	if (folio_test_unevictable(folio))
+		return NAMED_SWAP_SEQ_UNEVICTABLE;
+	if (folio_test_active(folio))
+		return NAMED_SWAP_SEQ_ACTIVE;
+	if (!folio_test_lru(folio))
+		return NAMED_SWAP_SEQ_NOT_LRU;
+	if (folio_memcg(folio) != lruvec_memcg(lruvec) ||
+	    folio_lruvec(folio) != lruvec)
+		return NAMED_SWAP_SEQ_WRONG_LRUVEC;
+	if (folio_zonenum(folio) != zone)
+		return NAMED_SWAP_SEQ_WRONG_ZONE;
+	if (folio_is_file_lru(folio) != type)
+		return NAMED_SWAP_SEQ_WRONG_TYPE;
+	if (folio_lru_gen(folio) != gen)
+		return NAMED_SWAP_SEQ_WRONG_GEN;
+	return NAMED_SWAP_SEQ_OK;
+}
+
+struct folio *named_swap_seq_go_back(struct address_space *mapping,
+				    struct folio *folio, struct lruvec *lruvec,
+				    int type, int zone, int gen,
+				    pgoff_t *go_back_to)
+{
+	struct folio *first = folio;
+	pgoff_t index = folio->index;
+	unsigned long steps = 0;
+
+	*go_back_to = index;
+	if (!mapping)
+		return first;
+
+	while (steps < NAMED_SWAP_RECLAIM_GO_BACK) {
+		XA_STATE(xas, &mapping->i_pages, index);
+		void *entry;
+		struct folio *prev;
+		pgoff_t prev_index;
+		enum named_swap_seq_stop cls;
+
+		if (!index)
+			break;
+
+		rcu_read_lock();
+		entry = xas_prev(&xas);
+		if (!entry || xa_is_value(entry)) {
+			rcu_read_unlock();
+			break;
+		}
+		prev = entry;
+		prev_index = prev->index;
+		if (prev_index + folio_nr_pages(prev) != index) {
+			rcu_read_unlock();
+			break;
+		}
+		/* Classify under RCU so the folio cannot free mid-check. */
+		cls = named_swap_seq_classify(prev, lruvec, type, zone, gen);
+		rcu_read_unlock();
+		if (cls != NAMED_SWAP_SEQ_OK)
+			break;
+		first = prev;
+		index = prev_index;
+		*go_back_to = index;
+		steps++;
+	}
+	return first;
+}
+
+struct folio *named_swap_seq_next(struct address_space *mapping,
+				 struct folio *folio, struct lruvec *lruvec,
+				 int type, int zone, int gen,
+				 enum named_swap_seq_stop *reason)
+{
+	XA_STATE(xas, &mapping->i_pages,
+		 folio->index + folio_nr_pages(folio));
+	void *entry;
+	struct folio *next;
+	pgoff_t expect = folio->index + folio_nr_pages(folio);
+	pgoff_t next_index;
+
+	if (!mapping) {
+		*reason = NAMED_SWAP_SEQ_MAPPING_GONE;
+		return NULL;
+	}
+
+	rcu_read_lock();
+	entry = xas_next_entry(&xas, ULONG_MAX);
+	if (!entry) {
+		rcu_read_unlock();
+		*reason = NAMED_SWAP_SEQ_NO_ENTRY;
+		return NULL;
+	}
+	if (xa_is_value(entry)) {
+		rcu_read_unlock();
+		*reason = NAMED_SWAP_SEQ_VALUE_ENTRY;
+		return NULL;
+	}
+	next = entry;
+	next_index = next->index;
+	if (next_index != expect) {
+		rcu_read_unlock();
+		*reason = NAMED_SWAP_SEQ_INDEX_GAP;
+		return NULL;
+	}
+	*reason = named_swap_seq_classify(next, lruvec, type, zone, gen);
+	rcu_read_unlock();
+	if (*reason != NAMED_SWAP_SEQ_OK)
+		return NULL;
+	return next;
 }

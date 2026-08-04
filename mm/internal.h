@@ -1519,6 +1519,18 @@ extern struct list_lru shadow_nodes;
 	}							\
 } while (0)
 
+enum named_swap_seq_stop
+named_swap_seq_classify(struct folio *folio, struct lruvec *lruvec,
+			int type, int zone, int gen);
+struct folio *named_swap_seq_go_back(struct address_space *mapping,
+				    struct folio *folio, struct lruvec *lruvec,
+				    int type, int zone, int gen,
+				    pgoff_t *go_back_to);
+struct folio *named_swap_seq_next(struct address_space *mapping,
+				 struct folio *folio, struct lruvec *lruvec,
+				 int type, int zone, int gen,
+				 enum named_swap_seq_stop *reason);
+
 /* mremap.c */
 unsigned long move_page_tables(struct vm_area_struct *vma,
 	unsigned long old_addr, struct vm_area_struct *new_vma,

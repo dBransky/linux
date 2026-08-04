@@ -355,7 +355,14 @@ static inline bool vma_is_named_swap(struct vm_area_struct *vma)
 
 static inline bool folio_test_named_swap(const struct folio *folio)
 {
-	return mapping_named_swap(folio->mapping);
+	struct address_space *mapping = folio->mapping;
+
+	/* Anon / swapcache encode flags in mapping; those are not named_swap. */
+	if ((unsigned long)mapping & PAGE_MAPPING_FLAGS)
+		return false;
+	if (!mapping)
+		return false;
+	return mapping_named_swap(mapping);
 }
 
 static inline gfp_t mapping_gfp_mask(struct address_space * mapping)

@@ -153,6 +153,13 @@ struct scan_control {
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
 
+	/*
+	 * Named-swap sequential reclaim isolated a contiguous run. Skip
+	 * folio_check_references() so young PTEs cannot KEEP/ACTIVATE those
+	 * folios back into the page cache (which creates ra_hole speckles).
+	 */
+	unsigned int ignore_refs:1;
+
 	/* Allocation order */
 	s8 order;
 
@@ -1079,6 +1086,29 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 }
 
 /*
+ * Emit one named_swap_reclaim_folio event per folio leaving shrink_folio_list.
+ * mapping/pgoff/index are captured before __remove_mapping clears them.
+ */
+static void named_swap_trace_reclaim(bool ns, bool *traced,
+				    struct address_space *mapping,
+				    pgoff_t pgoff, u64 index,
+				    enum named_swap_reclaim_result result,
+				    struct folio *folio,
+				    enum folio_references references)
+{
+	if (!ns || *traced)
+		return;
+	*traced = true;
+	trace_named_swap_reclaim_folio(mapping, pgoff, index, result,
+				       folio_test_dirty(folio),
+				       folio_test_writeback(folio),
+				       folio_mapped(folio),
+				       folio_mapcount(folio),
+				       folio_ref_count(folio),
+				       references);
+}
+
+/*
  * shrink_folio_list() returns the number of reclaimed pages
  */
 static unsigned int shrink_folio_list(struct list_head *folio_list,
@@ -1105,14 +1135,31 @@ retry:
 		enum folio_references references = FOLIOREF_RECLAIM;
 		bool dirty, writeback;
 		unsigned int nr_pages;
+		bool ns;
+		struct address_space *ns_mapping = NULL;
+		u64 ns_index = 0;
+		pgoff_t ns_pgoff;
+		enum named_swap_reclaim_result ns_result =
+			NAMED_SWAP_RECLAIM_KEEP_OTHER;
+		bool ns_traced = false;
 
 		cond_resched();
 
 		folio = lru_to_folio(folio_list);
 		list_del(&folio->lru);
 
-		if (!folio_trylock(folio))
+		ns = folio_test_named_swap(folio);
+		ns_pgoff = folio->index;
+		if (ns) {
+			ns_mapping = folio_mapping(folio);
+			if (ns_mapping)
+				ns_index = named_swap_mapping_index(ns_mapping);
+		}
+
+		if (!folio_trylock(folio)) {
+			ns_result = NAMED_SWAP_RECLAIM_KEEP_LOCK;
 			goto keep;
+		}
 
 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
 
@@ -1121,11 +1168,15 @@ retry:
 		/* Account the number of base pages */
 		sc->nr_scanned += nr_pages;
 
-		if (unlikely(!folio_evictable(folio)))
+		if (unlikely(!folio_evictable(folio))) {
+			ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_UNEVICTABLE;
 			goto activate_locked;
+		}
 
-		if (!sc->may_unmap && folio_mapped(folio))
+		if (!sc->may_unmap && folio_mapped(folio)) {
+			ns_result = NAMED_SWAP_RECLAIM_KEEP_MAPPED;
 			goto keep_locked;
+		}
 
 		/*
 		 * The number of dirty pages determines if a node is marked
@@ -1198,6 +1249,7 @@ retry:
 			    folio_test_reclaim(folio) &&
 			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
 				stat->nr_immediate += nr_pages;
+				ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_WRITEBACK;
 				goto activate_locked;
 
 			/* Case 2 above */
@@ -1220,6 +1272,7 @@ retry:
 				 */
 				folio_set_reclaim(folio);
 				stat->nr_writeback += nr_pages;
+				ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_WRITEBACK;
 				goto activate_locked;
 
 			/* Case 3 above */
@@ -1228,6 +1281,10 @@ retry:
 				folio_wait_writeback(folio);
 				/* then go back and try same folio again */
 				list_add_tail(&folio->lru, folio_list);
+				ns_result = NAMED_SWAP_RECLAIM_WAIT_WRITEBACK;
+				named_swap_trace_reclaim(ns, &ns_traced,
+					ns_mapping, ns_pgoff, ns_index,
+					ns_result, folio, references);
 				continue;
 			}
 		}
@@ -1237,9 +1294,11 @@ retry:
 
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
+			ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_REFERENCED;
 			goto activate_locked;
 		case FOLIOREF_KEEP:
 			stat->nr_ref_keep += nr_pages;
+			ns_result = NAMED_SWAP_RECLAIM_KEEP_REFERENCED;
 			goto keep_locked;
 		case FOLIOREF_RECLAIM:
 		case FOLIOREF_RECLAIM_CLEAN:
@@ -1254,6 +1313,10 @@ retry:
 		    (thp_migration_supported() || !folio_test_large(folio))) {
 			list_add(&folio->lru, &demote_folios);
 			folio_unlock(folio);
+			ns_result = NAMED_SWAP_RECLAIM_DEMOTE;
+			named_swap_trace_reclaim(ns, &ns_traced,
+				ns_mapping, ns_pgoff, ns_index,
+				ns_result, folio, references);
 			continue;
 		}
 
@@ -1264,31 +1327,43 @@ retry:
 		 */
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
 			if (!folio_test_swapcache(folio)) {
-				if (!(sc->gfp_mask & __GFP_IO))
+				if (!(sc->gfp_mask & __GFP_IO)) {
+					ns_result = NAMED_SWAP_RECLAIM_KEEP_OTHER;
 					goto keep_locked;
-				if (folio_maybe_dma_pinned(folio))
+				}
+				if (folio_maybe_dma_pinned(folio)) {
+					ns_result = NAMED_SWAP_RECLAIM_KEEP_OTHER;
 					goto keep_locked;
+				}
 				if (folio_test_large(folio)) {
 					/* cannot split folio, skip it */
-					if (!can_split_folio(folio, 1, NULL))
+					if (!can_split_folio(folio, 1, NULL)) {
+						ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_SWAP;
 						goto activate_locked;
+					}
 					/*
 					 * Split partially mapped folios right away.
 					 * We can free the unmapped pages without IO.
 					 */
 					if (data_race(!list_empty(&folio->_deferred_list) &&
 					    folio_test_partially_mapped(folio)) &&
-					    split_folio_to_list(folio, folio_list))
+					    split_folio_to_list(folio, folio_list)) {
+						ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_SWAP;
 						goto activate_locked;
+					}
 				}
 				if (!add_to_swap(folio)) {
 					int __maybe_unused order = folio_order(folio);
 
-					if (!folio_test_large(folio))
+					if (!folio_test_large(folio)) {
+						ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_SWAP;
 						goto activate_locked_split;
+					}
 					/* Fallback to swap normal pages */
-					if (split_folio_to_list(folio, folio_list))
+					if (split_folio_to_list(folio, folio_list)) {
+						ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_SWAP;
 						goto activate_locked;
+					}
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 					if (nr_pages >= HPAGE_PMD_NR) {
 						count_memcg_folio_events(folio,
@@ -1297,8 +1372,10 @@ retry:
 					}
 #endif
 					count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
-					if (!add_to_swap(folio))
+					if (!add_to_swap(folio)) {
+						ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_SWAP;
 						goto activate_locked_split;
+					}
 				}
 			}
 		}
@@ -1344,6 +1421,7 @@ retry:
 				if (!was_swapbacked &&
 				    folio_test_swapbacked(folio))
 					stat->nr_lazyfree_fail += nr_pages;
+				ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_UNMAP_FAIL;
 				goto activate_locked;
 			}
 		}
@@ -1355,8 +1433,10 @@ retry:
 		 * if the folio is pinned and thus potentially modified by the
 		 * pinning process as that may upset the filesystem.
 		 */
-		if (folio_maybe_dma_pinned(folio))
+		if (folio_maybe_dma_pinned(folio)) {
+			ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_PINNED;
 			goto activate_locked;
+		}
 
 		mapping = folio_mapping(folio);
 		if (folio_test_dirty(folio)) {
@@ -1385,15 +1465,22 @@ retry:
 						nr_pages);
 				folio_set_reclaim(folio);
 
+				ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_DIRTY;
 				goto activate_locked;
 			}
 
-			if (references == FOLIOREF_RECLAIM_CLEAN)
+			if (references == FOLIOREF_RECLAIM_CLEAN) {
+				ns_result = NAMED_SWAP_RECLAIM_KEEP_DIRTY;
 				goto keep_locked;
-			if (!may_enter_fs(folio, sc->gfp_mask))
+			}
+			if (!may_enter_fs(folio, sc->gfp_mask)) {
+				ns_result = NAMED_SWAP_RECLAIM_KEEP_DIRTY;
 				goto keep_locked;
-			if (!sc->may_writepage)
+			}
+			if (!sc->may_writepage) {
+				ns_result = NAMED_SWAP_RECLAIM_KEEP_DIRTY;
 				goto keep_locked;
+			}
 
 			/*
 			 * Folio is dirty. Flush the TLB if a writable entry
@@ -1403,6 +1490,7 @@ retry:
 			try_to_unmap_flush_dirty();
 			switch (pageout(folio, mapping, &plug, folio_list)) {
 			case PAGE_KEEP:
+				ns_result = NAMED_SWAP_RECLAIM_KEEP_PAGEOUT;
 				goto keep_locked;
 			case PAGE_ACTIVATE:
 				/*
@@ -1414,6 +1502,7 @@ retry:
 					sc->nr_scanned -= (nr_pages - 1);
 					nr_pages = 1;
 				}
+				ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_PAGEOUT;
 				goto activate_locked;
 			case PAGE_SUCCESS:
 				if (nr_pages > 1 && !folio_test_large(folio)) {
@@ -1422,20 +1511,28 @@ retry:
 				}
 				stat->nr_pageout += nr_pages;
 
-				if (folio_test_writeback(folio))
+				if (folio_test_writeback(folio)) {
+					ns_result = NAMED_SWAP_RECLAIM_KEEP_WRITEBACK;
 					goto keep;
-				if (folio_test_dirty(folio))
+				}
+				if (folio_test_dirty(folio)) {
+					ns_result = NAMED_SWAP_RECLAIM_KEEP_DIRTY;
 					goto keep;
+				}
 
 				/*
 				 * A synchronous write - probably a ramdisk.  Go
 				 * ahead and try to reclaim the folio.
 				 */
-				if (!folio_trylock(folio))
+				if (!folio_trylock(folio)) {
+					ns_result = NAMED_SWAP_RECLAIM_KEEP_LOCK;
 					goto keep;
+				}
 				if (folio_test_dirty(folio) ||
-				    folio_test_writeback(folio))
+				    folio_test_writeback(folio)) {
+					ns_result = NAMED_SWAP_RECLAIM_KEEP_WRITEBACK;
 					goto keep_locked;
+				}
 				mapping = folio_mapping(folio);
 				fallthrough;
 			case PAGE_CLEAN:
@@ -1467,8 +1564,10 @@ retry:
 		 * the folio on the LRU so it is swappable.
 		 */
 		if (folio_needs_release(folio)) {
-			if (!filemap_release_folio(folio, sc->gfp_mask))
+			if (!filemap_release_folio(folio, sc->gfp_mask)) {
+				ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_BUFFERS;
 				goto activate_locked;
+			}
 			if (!mapping && folio_ref_count(folio) == 1) {
 				folio_unlock(folio);
 				if (folio_put_testzero(folio))
@@ -1482,6 +1581,10 @@ retry:
 					 * leave it off the LRU).
 					 */
 					nr_reclaimed += nr_pages;
+					ns_result = NAMED_SWAP_RECLAIM_FREED_RACE;
+					named_swap_trace_reclaim(ns, &ns_traced,
+						ns_mapping, ns_pgoff, ns_index,
+						ns_result, folio, references);
 					continue;
 				}
 			}
@@ -1489,8 +1592,10 @@ retry:
 
 		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
 			/* follow __remove_mapping for reference */
-			if (!folio_ref_freeze(folio, 1))
+			if (!folio_ref_freeze(folio, 1)) {
+				ns_result = NAMED_SWAP_RECLAIM_KEEP_MAPPING;
 				goto keep_locked;
+			}
 			/*
 			 * The folio has only one reference left, which is
 			 * from the isolation. After the caller puts the
@@ -1502,8 +1607,10 @@ retry:
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
 		} else if (!mapping || !__remove_mapping(mapping, folio, true,
-							 sc->target_mem_cgroup))
+							 sc->target_mem_cgroup)) {
+			ns_result = NAMED_SWAP_RECLAIM_KEEP_MAPPING;
 			goto keep_locked;
+		}
 
 		folio_unlock(folio);
 free_it:
@@ -1512,6 +1619,10 @@ free_it:
 		 * all pages in it.
 		 */
 		nr_reclaimed += nr_pages;
+
+		ns_result = NAMED_SWAP_RECLAIM_FREED;
+		named_swap_trace_reclaim(ns, &ns_traced, ns_mapping, ns_pgoff,
+					 ns_index, ns_result, folio, references);
 
 		folio_unqueue_deferred_split(folio);
 		if (folio_batch_add(&free_folios, folio) == 0) {
@@ -1530,6 +1641,8 @@ activate_locked_split:
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
 		}
+		if (ns_result == NAMED_SWAP_RECLAIM_KEEP_OTHER)
+			ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_SWAP;
 activate_locked:
 		/* Not a candidate for swapping, so reclaim swap space. */
 		if (folio_test_swapcache(folio) &&
@@ -1542,9 +1655,13 @@ activate_locked:
 			stat->nr_activate[type] += nr_pages;
 			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
 		}
+		if (ns_result == NAMED_SWAP_RECLAIM_KEEP_OTHER)
+			ns_result = NAMED_SWAP_RECLAIM_ACTIVATE_OTHER;
 keep_locked:
 		folio_unlock(folio);
 keep:
+		named_swap_trace_reclaim(ns, &ns_traced, ns_mapping, ns_pgoff,
+					 ns_index, ns_result, folio, references);
 		list_add(&folio->lru, &ret_folios);
 		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
 				folio_test_unevictable(folio), folio);
@@ -4445,7 +4562,17 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 
 	/* waiting for writeback */
 	if (writeback || (type == LRU_GEN_FILE && dirty)) {
+		int old_gen = gen;
+
 		gen = folio_inc_gen(lruvec, folio, true);
+		/*
+		 * Named-swap is file LRU: dirty/WB folios are promoted here and
+		 * never isolated. Trace so ra_hole can be blamed on flusher.
+		 */
+		if (folio_test_named_swap(folio))
+			trace_named_swap_sort_promote(folio,
+				named_swap_mapping_index(folio_mapping(folio)),
+				dirty, writeback, old_gen, gen);
 		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
 	}
@@ -4524,9 +4651,133 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 
 			scanned += delta;
 
-			if (sort_folio(lruvec, folio, sc, tier))
+			if (sort_folio(lruvec, folio, sc, tier)) {
 				sorted += delta;
-			else if (isolate_folio(lruvec, folio, sc)) {
+			} else if (folio_test_named_swap(folio) &&
+				   !folio_test_dirty(folio) &&
+				   !folio_test_writeback(folio) &&
+				   folio_mapping(folio)) {
+				struct address_space *mapping = folio_mapping(folio);
+				struct folio *cur;
+				pgoff_t seed = folio->index;
+				pgoff_t go_back_to = seed;
+				pgoff_t window_start, window_end;
+				unsigned int hits = 0;
+				bool seed_handled = false;
+				enum named_swap_seq_stop reason = NAMED_SWAP_SEQ_OK;
+				u64 ns_index = named_swap_mapping_index(mapping);
+
+				cur = named_swap_seq_go_back(mapping, folio, lruvec,
+							     type, zone, gen,
+							     &go_back_to);
+				window_start = cur->index;
+				window_end = window_start;
+				trace_named_swap_seq_start(mapping, ns_index, seed,
+							   go_back_to,
+							   NAMED_SWAP_RECLAIM_AHEAD);
+
+				while (cur && hits < NAMED_SWAP_RECLAIM_AHEAD) {
+					pgoff_t cur_idx = cur->index;
+					int cur_delta = folio_nr_pages(cur);
+					struct folio *next;
+					enum named_swap_seq_stop step_reason;
+					bool dirty = folio_test_dirty(cur);
+					bool wb = folio_test_writeback(cur);
+					int fgen = folio_lru_gen(cur);
+
+					step_reason = named_swap_seq_classify(cur,
+						lruvec, type, zone, gen);
+					if (step_reason != NAMED_SWAP_SEQ_OK) {
+						trace_named_swap_seq_step(mapping,
+							ns_index, cur_idx, cur_idx,
+							false, step_reason, dirty,
+							wb, fgen, hits);
+						reason = step_reason;
+						break;
+					}
+
+					if (cur != folio)
+						scanned += cur_delta;
+
+					if (sort_folio(lruvec, cur, sc, tier)) {
+						sorted += cur_delta;
+						trace_named_swap_seq_step(mapping,
+							ns_index, cur_idx, cur_idx,
+							false, NAMED_SWAP_SEQ_SORT,
+							dirty, wb, fgen, hits);
+						reason = NAMED_SWAP_SEQ_SORT;
+						if (cur == folio)
+							seed_handled = true;
+						break;
+					}
+
+					if (!isolate_folio(lruvec, cur, sc)) {
+						list_move(&cur->lru, &moved);
+						skipped_zone += cur_delta;
+						trace_named_swap_seq_step(mapping,
+							ns_index, cur_idx, cur_idx,
+							false,
+							NAMED_SWAP_SEQ_ISOLATE_FAIL,
+							dirty, wb, fgen, hits);
+						reason = NAMED_SWAP_SEQ_ISOLATE_FAIL;
+						if (cur == folio)
+							seed_handled = true;
+						break;
+					}
+
+					list_add(&cur->lru, list);
+					isolated += cur_delta;
+					hits++;
+					window_end = cur_idx + cur_delta;
+					if (cur == folio)
+						seed_handled = true;
+
+					trace_named_swap_seq_step(mapping, ns_index,
+						cur_idx, cur_idx + cur_delta, true,
+						NAMED_SWAP_SEQ_OK, dirty, wb, fgen,
+						hits);
+
+					next = named_swap_seq_next(mapping, cur,
+						lruvec, type, zone, gen,
+						&step_reason);
+					if (!next) {
+						reason = step_reason;
+						trace_named_swap_seq_step(mapping,
+							ns_index, cur_idx, cur_idx,
+							false, step_reason, false,
+							false, gen, hits);
+						break;
+					}
+					cur = next;
+				}
+
+				if (hits >= NAMED_SWAP_RECLAIM_AHEAD)
+					reason = NAMED_SWAP_SEQ_WINDOW_FULL;
+
+				trace_named_swap_seq_stop(mapping, ns_index, reason,
+					hits, window_start, window_end,
+					NAMED_SWAP_RECLAIM_AHEAD);
+
+				/*
+				 * Contiguous isolate must actually free: MGLRU
+				 * reference checks would put mapped young pages
+				 * back and leave page-cache holes for readahead.
+				 */
+				if (hits)
+					sc->ignore_refs = 1;
+
+				if (!seed_handled) {
+					if (sort_folio(lruvec, folio, sc, tier))
+						sorted += delta;
+					else if (isolate_folio(lruvec, folio, sc)) {
+						list_add(&folio->lru, list);
+						isolated += delta;
+					} else {
+						list_move(&folio->lru, &moved);
+						skipped_zone += delta;
+					}
+				}
+			} else if (isolate_folio(lruvec, folio, sc)) {
 				list_add(&folio->lru, list);
 				isolated += delta;
 			} else {
@@ -4642,6 +4893,7 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
 	struct reclaim_stat stat;
 	struct lru_gen_mm_walk *walk;
 	bool skip_retry = false;
+	bool ignore_references;
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
@@ -4659,8 +4911,15 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
 
 	if (list_empty(&list))
 		return scanned;
+
+	/*
+	 * Consume ignore_refs for this eviction (incl. retry). Set by named_swap
+	 * sequential isolate so shrink does not KEEP/ACTIVATE on PTE refs.
+	 */
+	ignore_references = sc->ignore_refs;
+	sc->ignore_refs = 0;
 retry:
-	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false);
+	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, ignore_references);
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
 	sc->nr_reclaimed += reclaimed;
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
