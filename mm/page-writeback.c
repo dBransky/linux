@@ -1838,29 +1838,51 @@ static void balance_wb_limits(struct dirty_throttle_control *dtc,
 static void named_swap_trace_balance_dirty(struct address_space *mapping,
 		struct bdi_writeback *wb, struct dirty_throttle_control *dtc,
 		unsigned long dirty_ratelimit, unsigned long task_ratelimit,
-		unsigned long pages_dirtied, long pause, bool freerun)
+		unsigned long pages_dirtied, long pause, long period,
+		long min_pause, long max_pause, bool freerun)
 {
-	unsigned int flags = 0;
+	struct named_swap_dirty_trace t = { };
+	unsigned long elapsed, dirtied;
 
 	if (!mapping || !mapping_named_swap(mapping))
 		return;
 
 	if (freerun)
-		flags |= 1;
+		t.flags |= 1;
 	if (wb->dirty_exceeded)
-		flags |= 2;
+		t.flags |= 2;
+
+	t.write_bw = READ_ONCE(wb->write_bandwidth);
+	t.avg_write_bw = READ_ONCE(wb->avg_write_bandwidth);
+	t.balanced_dirty_ratelimit = READ_ONCE(wb->balanced_dirty_ratelimit);
+
+	elapsed = max(jiffies - READ_ONCE(wb->bw_time_stamp), 1UL);
+	dirtied = percpu_counter_read(&wb->stat[WB_DIRTIED]);
+	if (dirtied > wb->dirtied_stamp)
+		t.dirty_rate = (dirtied - wb->dirtied_stamp) * HZ / elapsed;
+
+	if (dtc) {
+		t.thresh = dtc->thresh;
+		t.bg_thresh = dtc->bg_thresh;
+		t.dirty = dtc->dirty;
+		t.wb_thresh = dtc->wb_thresh;
+		t.wb_dirty = dtc->wb_dirty;
+		t.freerun_ceil = dirty_freerun_ceiling(dtc->thresh,
+						       dtc->bg_thresh);
+		t.setpoint = (t.freerun_ceil + dtc->thresh) / 2;
+		t.pos_ratio = dtc->pos_ratio;
+	}
+
+	t.dirty_ratelimit = dirty_ratelimit;
+	t.task_ratelimit = task_ratelimit;
+	t.dirtied = pages_dirtied;
+	t.pause_ms = pause * 1000 / HZ;
+	t.period_ms = period * 1000 / HZ;
+	t.min_pause_ms = min_pause * 1000 / HZ;
+	t.max_pause_ms = max_pause * 1000 / HZ;
 
 	trace_named_swap_balance_dirty(mapping,
-				       named_swap_mapping_index(mapping),
-				       dtc ? dtc->thresh : 0,
-				       dtc ? dtc->bg_thresh : 0,
-				       dtc ? dtc->dirty : 0,
-				       dtc ? dtc->wb_thresh : 0,
-				       dtc ? dtc->wb_dirty : 0,
-				       dirty_ratelimit, task_ratelimit,
-				       pages_dirtied,
-				       pause * 1000 / HZ,
-				       flags);
+				       named_swap_mapping_index(mapping), &t);
 }
 
 static int balance_dirty_pages(struct bdi_writeback *wb,
@@ -1931,7 +1953,8 @@ free_running:
 				m_intv = domain_poll_intv(mdtc, strictlimit);
 			current->nr_dirtied_pause = min(intv, m_intv);
 			named_swap_trace_balance_dirty(mapping, wb, gdtc, 0, 0,
-						       pages_dirtied, 0, true);
+						       pages_dirtied, 0, 0, 0, 0,
+						       true);
 			break;
 		}
 
@@ -2012,7 +2035,9 @@ free_running:
 						       dirty_ratelimit,
 						       task_ratelimit,
 						       pages_dirtied,
-						       min(pause, 0L), false);
+						       min(pause, 0L), period,
+						       min_pause, max_pause,
+						       false);
 			if (pause < -HZ) {
 				current->dirty_paused_when = now;
 				current->nr_dirtied = 0;
@@ -2044,7 +2069,8 @@ pause:
 					  start_time);
 		named_swap_trace_balance_dirty(mapping, wb, sdtc,
 					       dirty_ratelimit, task_ratelimit,
-					       pages_dirtied, pause, false);
+					       pages_dirtied, pause, period,
+					       min_pause, max_pause, false);
 		if (flags & BDP_ASYNC) {
 			ret = -EAGAIN;
 			break;
