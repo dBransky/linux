@@ -508,9 +508,10 @@ static void wb_update_bandwidth_workfn(struct work_struct *work)
 }
 
 /*
- * Initial write bandwidth: 100 MB/s
+ * Initial write bandwidth: 200 MB/s
+ * (experiment: was 100; raise cold-start BDI estimate toward this HDD's peak)
  */
-#define INIT_BW		(100 << (20 - PAGE_SHIFT))
+#define INIT_BW		(200 << (20 - PAGE_SHIFT))
 
 static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 		   gfp_t gfp)
