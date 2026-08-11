@@ -551,6 +551,42 @@ fallback:
 				 ra->async_size);
 }
 
+/*
+ * Cap for RA while a reader shares the bdev with real background write
+ * traffic (flusher / dirty writeback).  Kept at 1024 pages (4MiB) to stay
+ * under the host RAID sequential-boost cliff observed around 6MiB.
+ *
+ * Do not key this off bd_seq_hits alone: on striped/RAID+ext4, even a
+ * single stream can keep seq_hits low, which would pin the large cap
+ * forever.  Grow only while THIS mapping is dirty/under writeback;
+ * otherwise callers must clamp ra->size back to the BDI max.
+ */
+#define FILEMAP_RA_MULTISTREAM_MAX	1024UL
+
+static bool ractl_want_multistream_ra(struct readahead_control *ractl)
+{
+	struct address_space *mapping = ractl->mapping;
+
+	if (!mapping)
+		return false;
+
+	/*
+	 * Only this mapping's dirty/writeback counts as competing background
+	 * work.  bdi_has_dirty_io() is too coarse on a shared disk BDI (root
+	 * FS / journal dirtiness would pin the large cap forever).
+	 */
+	return mapping_tagged(mapping, PAGECACHE_TAG_DIRTY) ||
+	       mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK);
+}
+
+static void ra_clamp_to_max(struct file_ra_state *ra, unsigned long max_pages)
+{
+	if (ra->size > max_pages)
+		ra->size = max_pages;
+	if (ra->async_size > ra->size)
+		ra->async_size = ra->size;
+}
+
 static unsigned long ractl_max_pages(struct readahead_control *ractl,
 		unsigned long req_size)
 {
@@ -563,6 +599,10 @@ static unsigned long ractl_max_pages(struct readahead_control *ractl,
 	 */
 	if (req_size > max_pages && bdi->io_pages > max_pages)
 		max_pages = min(req_size, bdi->io_pages);
+
+	if (ractl_want_multistream_ra(ractl))
+		max_pages = max(max_pages, FILEMAP_RA_MULTISTREAM_MAX);
+
 	return max_pages;
 }
 
@@ -609,6 +649,7 @@ void page_cache_sync_ra(struct readahead_control *ractl,
 		ra->size = get_init_ra_size(req_count, max_pages);
 		ra->async_size = ra->size > req_count ? ra->size - req_count :
 							ra->size >> 1;
+		ra_clamp_to_max(ra, max_pages);
 		if (named_swap)
 			trace_named_swap_ra_window(ractl->mapping, ns_index,
 				NAMED_SWAP_RA_SYNC_INIT, ra->start, ra->size,
@@ -646,6 +687,7 @@ void page_cache_sync_ra(struct readahead_control *ractl,
 	ra->start = index;
 	ra->size = min(contig_count + req_count, max_pages);
 	ra->async_size = 1;
+	ra_clamp_to_max(ra, max_pages);
 	if (named_swap)
 		trace_named_swap_ra_window(ractl->mapping, ns_index,
 			NAMED_SWAP_RA_SYNC_HISTORY, ra->start, ra->size,
@@ -695,9 +737,11 @@ void page_cache_async_ra(struct readahead_control *ractl,
 		ra->start += ra->size;
 		/*
 		 * In the case of MADV_HUGEPAGE, the actual size might exceed
-		 * the readahead window.
+		 * the readahead window.  Still clamp to max_pages when the
+		 * multistream boost has dropped so a lone stream shrinks.
 		 */
 		ra->size = max(ra->size, get_next_ra_size(ra, max_pages));
+		ra_clamp_to_max(ra, max_pages);
 		ra->async_size = ra->size;
 		if (named_swap)
 			trace_named_swap_ra_window(ractl->mapping, ns_index,
@@ -724,6 +768,7 @@ void page_cache_async_ra(struct readahead_control *ractl,
 	ra->size = start - index;	/* old async_size */
 	ra->size += req_count;
 	ra->size = get_next_ra_size(ra, max_pages);
+	ra_clamp_to_max(ra, max_pages);
 	ra->async_size = ra->size;
 	if (named_swap)
 		trace_named_swap_ra_window(ractl->mapping, ns_index,
