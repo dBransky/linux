@@ -1239,6 +1239,7 @@ out:
 	if (offset_in_page(ret))
 		locked = false;
 	mmap_write_unlock(current->mm);
+	named_swap_fs_flush();
 	if (locked && new_len > old_len)
 		mm_populate(new_addr + old_len, new_len - old_len);
 out_unlocked:

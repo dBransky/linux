@@ -6909,6 +6909,7 @@ success:
 
 fail:
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 	return NULL;
 }
 #endif

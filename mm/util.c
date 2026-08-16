@@ -556,6 +556,7 @@ int account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc)
 	ret = __account_locked_vm(mm, pages, inc, current,
 				  capable(CAP_IPC_LOCK));
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 
 	return ret;
 }
@@ -588,6 +589,7 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 		ret = do_mmap(file, addr, len, prot, flag, 0, pgoff, &populate,
 			      &uf);
 		mmap_write_unlock(mm);
+		named_swap_fs_flush();
 		if (named_swap_file)
 			fput(named_swap_file);
 		userfaultfd_unmap_complete(mm, &uf);

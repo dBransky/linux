@@ -203,6 +203,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 
 success:
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 success_unlocked:
 	userfaultfd_unmap_complete(mm, &uf);
 	if (populate)
@@ -212,6 +213,7 @@ success_unlocked:
 out:
 	mm->brk = origbrk;
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 	return origbrk;
 }
 
@@ -1049,6 +1051,7 @@ struct vm_area_struct *expand_stack(struct mm_struct *mm, unsigned long addr)
 		goto success;
 
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 	return NULL;
 
 success:
@@ -1242,6 +1245,7 @@ int vm_brk_flags(unsigned long addr, unsigned long request, unsigned long flags)
 	ret = do_brk_flags(&vmi, vma, addr, len, flags);
 	populate = ((mm->def_flags & VM_LOCKED) != 0);
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 	userfaultfd_unmap_complete(mm, &uf);
 	if (populate && !ret)
 		mm_populate(addr, len);
@@ -1250,6 +1254,7 @@ int vm_brk_flags(unsigned long addr, unsigned long request, unsigned long flags)
 munmap_failed:
 limits_failed:
 	mmap_write_unlock(mm);
+	named_swap_fs_flush();
 	return ret;
 }
 EXPORT_SYMBOL(vm_brk_flags);
@@ -1782,6 +1787,7 @@ bool mmap_read_lock_maybe_expand(struct mm_struct *mm,
 	mmap_write_lock(mm);
 	if (expand_downwards(new_vma, addr)) {
 		mmap_write_unlock(mm);
+		named_swap_fs_flush();
 		return false;
 	}
 
