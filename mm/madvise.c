@@ -1705,6 +1705,7 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 		mmap_write_unlock(mm);
 	else
 		mmap_read_unlock(mm);
+	named_swap_fs_flush();
 
 	return error;
 }

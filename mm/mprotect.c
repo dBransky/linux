@@ -852,6 +852,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 
 out:
 	mmap_write_unlock(current->mm);
+	named_swap_fs_flush();
 	return error;
 }
 
@@ -896,6 +897,7 @@ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
 	ret = pkey;
 out:
 	mmap_write_unlock(current->mm);
+	named_swap_fs_flush();
 	return ret;
 }
 
@@ -906,6 +908,7 @@ SYSCALL_DEFINE1(pkey_free, int, pkey)
 	mmap_write_lock(current->mm);
 	ret = mm_pkey_free(current->mm, pkey);
 	mmap_write_unlock(current->mm);
+	named_swap_fs_flush();
 
 	/*
 	 * We could provide warnings or errors if any VMA still

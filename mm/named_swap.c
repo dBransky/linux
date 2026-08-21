@@ -42,6 +42,9 @@
 #undef CREATE_TRACE_POINTS
 #include <linux/mm_inline.h>
 #include <linux/memcontrol.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/sort.h>
 #include "internal.h"
 
 /*
@@ -51,8 +54,11 @@
 struct named_swap_file {
 	struct file *lower;
 	spinlock_t bind_lock;
+	struct mutex size_lock;
 	u64 index;
 	unsigned long nr_pages;
+	bool holes_dirty;
+	loff_t vfs_size;
 };
 
 static DEFINE_XARRAY(named_swap_files);
@@ -615,6 +621,295 @@ static void named_swap_xa_remove(u64 index)
 		fput(file);
 }
 
+loff_t named_swap_file_blocks(struct file *file) {
+    struct file *lower;
+
+    if (!file)
+        return -EINVAL;
+
+    lower = named_swap_lower(file);
+    if (!lower)
+        return -EINVAL;
+
+    /* Return the number of 512-byte blocks allocated to the lower inode */
+    return file_inode(lower)->i_blocks;
+}
+EXPORT_SYMBOL_GPL(named_swap_file_blocks);
+
+loff_t named_swap_file_size(struct file *file){
+	struct file *lower;
+
+    if (!file)
+        return -EINVAL;
+
+    lower = named_swap_lower(file);
+    if (!lower)
+        return -EINVAL;
+
+    // Use file_inode() to safely get the inode, 
+    // and return it as a 64-bit loff_t
+    return i_size_read(file_inode(lower));
+
+}
+EXPORT_SYMBOL(named_swap_file_size);
+
+
+struct named_swap_dirty {
+	struct list_head list;
+	struct task_struct *task;
+	struct file *file;
+};
+
+static LIST_HEAD(named_swap_dirty_pending);
+static DEFINE_SPINLOCK(named_swap_dirty_lock);
+
+static void named_swap_file_mark_dirty(struct file *file)
+{
+	struct named_swap_dirty *d, *old;
+
+	if (!file)
+		return;
+
+	spin_lock(&named_swap_dirty_lock);
+	list_for_each_entry(old, &named_swap_dirty_pending, list) {
+		if (old->task == current && old->file == file) {
+			spin_unlock(&named_swap_dirty_lock);
+			return;
+		}
+	}
+	spin_unlock(&named_swap_dirty_lock);
+
+	d = kmalloc(sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return;
+	d->task = current;
+	d->file = get_file(file);
+
+	spin_lock(&named_swap_dirty_lock);
+	list_for_each_entry(old, &named_swap_dirty_pending, list) {
+		if (old->task == current && old->file == file) {
+			spin_unlock(&named_swap_dirty_lock);
+			fput(d->file);
+			kfree(d);
+			return;
+		}
+	}
+	list_add_tail(&d->list, &named_swap_dirty_pending);
+	spin_unlock(&named_swap_dirty_lock);
+}
+
+static loff_t named_swap_vma_file_end(const struct vm_area_struct *vma)
+{
+	return ((loff_t)vma->vm_pgoff << PAGE_SHIFT) +
+	       (vma->vm_end - vma->vm_start);
+}
+
+static loff_t named_swap_file_needed(struct mm_struct *mm, struct file *file)
+{
+	struct vm_area_struct *tmp;
+	loff_t need = 0;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	if (!mm || !file)
+		return 0;
+
+	for_each_vma(vmi, tmp) {
+		loff_t end;
+
+		if (!tmp->vm_file || tmp->vm_file->f_mapping != file->f_mapping)
+			continue;
+		if (!vma_pages(tmp))
+			continue;
+		end = named_swap_vma_file_end(tmp);
+		if (end > need)
+			need = end;
+	}
+	return need;
+}
+
+static int named_swap_file_set_size(struct file *file, loff_t new_size,
+				    bool sparse_ok)
+{
+	struct file *lower;
+	struct named_swap_file *ns;
+	loff_t old_size;
+
+	if (!file || new_size < 0)
+		return -EINVAL;
+
+	ns = file->private_data;
+	lower = named_swap_lower(file);
+	if (!lower)
+		return -EINVAL;
+
+	if (ns)
+		mutex_lock(&ns->size_lock);
+
+	old_size = i_size_read(file_inode(lower));
+	if (new_size == old_size) {
+		if (ns)
+			mutex_unlock(&ns->size_lock);
+		return 0;
+	}
+
+	i_size_write(file_inode(file), new_size);
+	i_size_write(file_inode(lower), new_size);
+	if (ns)
+		mutex_unlock(&ns->size_lock);
+	named_swap_file_mark_dirty(file);
+	return 0;
+}
+
+static void named_swap_file_sync(struct file *file)
+{
+	struct file *lower;
+	struct named_swap_file *ns;
+	loff_t target;
+	int ret;
+
+	if (!file)
+		return;
+	ns = file->private_data;
+	lower = named_swap_lower(file);
+	if (!lower)
+		return;
+
+	target = i_size_read(file_inode(lower));
+	if (target > 0) {
+		ret = vfs_fallocate(file, 0, 0, target);
+		if (ret && ret != -ENOSPC && ret != -EDQUOT &&
+		    ret != -EOPNOTSUPP && ret != -EROFS)
+			pr_warn_ratelimited(
+				"named_swap_file_sync: fallocate %lld err=%d\n",
+				target, ret);
+		else if (ns && target > ns->vfs_size)
+			ns->vfs_size = target;
+	}
+	if (ns && target < ns->vfs_size) {
+		ret = vfs_truncate(&lower->f_path, target);
+		if (!ret)
+			ns->vfs_size = target;
+	}
+}
+
+void named_swap_fs_flush(void)
+{
+	LIST_HEAD(local);
+	struct named_swap_dirty *d, *tmp;
+
+	spin_lock(&named_swap_dirty_lock);
+	if (list_empty(&named_swap_dirty_pending)) {
+		spin_unlock(&named_swap_dirty_lock);
+		return;
+	}
+	list_for_each_entry_safe(d, tmp, &named_swap_dirty_pending, list) {
+		if (d->task == current)
+			list_move_tail(&d->list, &local);
+	}
+	spin_unlock(&named_swap_dirty_lock);
+
+	list_for_each_entry_safe(d, tmp, &local, list) {
+		list_del(&d->list);
+		named_swap_file_sync(d->file);
+		fput(d->file);
+		kfree(d);
+	}
+}
+
+void named_swap_uncommit_queue(struct vm_area_struct *vma)
+{
+	struct file *file;
+	struct named_swap_file *ns;
+	loff_t needed;
+
+	if (!vma || !vma_is_named_swap(vma) || !vma->vm_file)
+		return;
+
+	file = vma->vm_file;
+	needed = named_swap_file_needed(vma->vm_mm, file);
+	ns = file->private_data;
+	if (ns) {
+		mutex_lock(&ns->size_lock);
+		ns->holes_dirty = true;
+		mutex_unlock(&ns->size_lock);
+	}
+	named_swap_file_set_size(file, needed, false);
+	named_swap_file_mark_dirty(file);
+}
+
+int named_swap_enlarge(struct vm_area_struct *vma, unsigned long delta)
+{
+	struct file *file;
+	loff_t old_size;
+	int ret;
+
+	if (!vma || !vma->vm_file)
+		return -EINVAL;
+
+	file = vma->vm_file;
+	old_size = named_swap_file_size(file);
+	if (old_size < 0)
+		return old_size;
+
+	ret = named_swap_file_set_size(file, old_size + (loff_t)delta, false);
+	named_swap_hist_record(vma, NAMED_SWAP_RESIZE_ENLARGE, vma->vm_start,
+			       delta, old_size,
+			       ret ? old_size : old_size + (loff_t)delta,
+			       named_swap_vma_index(vma), ret);
+	return ret;
+}
+
+int named_swap_shrink(struct vm_area_struct *vma, unsigned long delta)
+{
+	struct file *file;
+	loff_t old_size;
+	loff_t needed;
+	int ret;
+
+	if (!vma || !vma->vm_file)
+		return -EINVAL;
+
+	file = vma->vm_file;
+	old_size = named_swap_file_size(file);
+	if (old_size < 0)
+		return old_size;
+
+	needed = named_swap_file_needed(vma->vm_mm, file);
+	ret = named_swap_file_set_size(file, needed, false);
+	named_swap_hist_record(vma, NAMED_SWAP_RESIZE_SHRINK, vma->vm_start,
+			       delta, old_size, needed,
+			       named_swap_vma_index(vma), ret);
+	return ret;
+}
+
+int named_swap_deallocate(struct vm_area_struct *vma, unsigned long start,
+			  unsigned long end)
+{
+	struct file *file;
+	struct file *lower;
+	loff_t offset;
+	loff_t len;
+
+	if (!vma || start >= end)
+		return -EINVAL;
+
+	file = vma->vm_file;
+	if (!file)
+		return -EINVAL;
+
+	lower = named_swap_lower(file);
+	if (!lower)
+		return -EINVAL;
+
+	offset = ((loff_t)start - vma->vm_start) +
+		 ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
+	len = (loff_t)(end - start);
+
+	return vfs_fallocate(lower,
+			     FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+			     offset, len);
+}
+
 static void named_swap_xa_destroy(void)
 {
 	struct file *file;
@@ -904,6 +1199,7 @@ static long named_swap_fallocate(struct file *file, int mode, loff_t offset, lof
 	if (ret) {
 		printk(KERN_ERR "named_swap_fallocate: vfs_fallocate failed: file=%px mode=%d offset=%llu len=%llu ret=%ld\n", file, mode, offset, len, ret);
 	}
+	file->f_inode->i_size = named_swap_lower(file)->f_inode->i_size; // update size of wrapper file to match lower file
 	return ret;
 }
 
@@ -916,6 +1212,15 @@ static const struct file_operations named_swap_fops = {
 	.fsync		= named_swap_fsync,
 	.release	= named_swap_release,
 };
+
+
+bool is_file_named_swap(struct file *file){
+	
+	if(!file)
+		return false;
+
+	return file->f_op == &named_swap_fops;
+}
 
 static int named_swap_wipe_dir(const char *path)
 {
