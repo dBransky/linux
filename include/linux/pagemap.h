@@ -353,6 +353,11 @@ static inline bool vma_is_named_swap(struct vm_area_struct *vma)
 	return mapping_named_swap(vma->vm_file->f_mapping);
 }
 
+static inline bool vma_is_named_swap_growsdown(struct vm_area_struct *vma)
+{
+	return vma_is_named_swap(vma) && (vma->vm_flags & VM_GROWSDOWN);
+}
+
 static inline bool folio_test_named_swap(const struct folio *folio)
 {
 	struct address_space *mapping = folio->mapping;
@@ -1103,7 +1108,11 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma,
 					unsigned long address)
 {
 	pgoff_t pgoff;
-	pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
+
+	if (unlikely(vma_is_named_swap_growsdown(vma)))
+		pgoff = (vma->vm_end - PAGE_SIZE - address) >> PAGE_SHIFT;
+	else
+		pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
 	pgoff += vma->vm_pgoff;
 	return pgoff;
 }

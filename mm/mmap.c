@@ -479,7 +479,9 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 
 			if (!file->f_op->mmap)
 				return -ENODEV;
-			if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
+			if (vm_flags & VM_GROWSUP)
+				return -EINVAL;
+			if ((vm_flags & VM_GROWSDOWN) && !is_file_named_swap(file))
 				return -EINVAL;
 			break;
 

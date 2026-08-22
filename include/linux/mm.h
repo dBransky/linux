@@ -1030,6 +1030,7 @@ int named_swap_enlarge(struct vm_area_struct *vma, unsigned long delta);
 int named_swap_shrink(struct vm_area_struct *vma, unsigned long delta);
 int named_swap_deallocate(struct vm_area_struct *vma, unsigned long start,
 			  unsigned long end);
+void named_swap_drop_prepared_file(struct file *file);
 bool is_file_named_swap(struct file *file);
 void named_swap_store_pte(struct mm_struct *mm, struct vm_area_struct *vma,
 			  unsigned long address, pte_t *pte);

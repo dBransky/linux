@@ -1511,7 +1511,13 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
 	if (!folio_test_anon(folio)) {
 		ptent = get_and_clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
 		if (pte_dirty(ptent)) {
-			folio_mark_dirty(folio);
+			/*
+			 * Named-swap folios are dirtied at fault time. Marking
+			 * them dirty again here hits ext4_dirty_folio() without
+			 * buffers (no page_mkwrite on this zap path).
+			 */
+			if (!vma_is_named_swap(vma))
+				folio_mark_dirty(folio);
 			if (tlb_delay_rmap(tlb)) {
 				delay_rmap = true;
 				*force_flush = true;

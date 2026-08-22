@@ -9,6 +9,7 @@
  */
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
+#include <linux/cred.h>
 #include <linux/err.h>
 #include <linux/dcache.h>
 #include <linux/falloc.h>
@@ -17,6 +18,8 @@
 #include <linux/init.h>
 #include <linux/debugfs.h>
 #include <linux/hash.h>
+#include <linux/init_task.h>
+#include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/ptrace.h>
 #include <linux/sched/debug.h>
@@ -621,6 +624,51 @@ static void named_swap_xa_remove(u64 index)
 		fput(file);
 }
 
+static void named_swap_xa_erase(u64 index)
+{
+	mutex_lock(&named_swap_xa_lock);
+	xa_erase(&named_swap_files, index);
+	mutex_unlock(&named_swap_xa_lock);
+}
+
+/*
+ * Drop the xarray pin on a named-swap file that was prepared for mmap but
+ * never installed as vma->vm_file (typically because the range merged into
+ * an adjacent named-swap VMA). The caller still owns its struct file ref.
+ */
+void named_swap_drop_prepared_file(struct file *file)
+{
+	u64 index;
+
+	if (!file || named_swap_file_index(file, &index))
+		return;
+	named_swap_xa_remove(index);
+}
+
+static bool named_swap_range_mapped(struct address_space *mapping,
+				    pgoff_t start, pgoff_t last)
+{
+	XA_STATE(xas, &mapping->i_pages, start);
+	struct folio *folio;
+
+	if (!mapping || last < start)
+		return false;
+
+	rcu_read_lock();
+	xas_for_each(&xas, folio, last) {
+		if (xas_retry(&xas, folio))
+			continue;
+		if (xa_is_value(folio))
+			continue;
+		if (folio_mapped(folio)) {
+			rcu_read_unlock();
+			return true;
+		}
+	}
+	rcu_read_unlock();
+	return false;
+}
+
 loff_t named_swap_file_blocks(struct file *file) {
     struct file *lower;
 
@@ -905,6 +953,11 @@ int named_swap_deallocate(struct vm_area_struct *vma, unsigned long start,
 		 ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
 	len = (loff_t)(end - start);
 
+	if (named_swap_range_mapped(file->f_mapping,
+				    offset >> PAGE_SHIFT,
+				    (offset + len - 1) >> PAGE_SHIFT))
+		return 0;
+
 	return vfs_fallocate(lower,
 			     FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
 			     offset, len);
@@ -1179,7 +1232,8 @@ static int named_swap_release(struct inode *inode, struct file *file)
 		 */
 		WARN_ON(file_count(lower) > 1);
 		atomic_long_sub(ns->nr_pages, &named_swap_pages);
-		named_swap_xa_remove(ns->index);
+		/* xa_remove() fputs the wrapper; we are already in its release. */
+		named_swap_xa_erase(ns->index);
 		spin_lock(&ns->bind_lock);
 		lower->f_mapping->anon_vma = NULL;
 		spin_unlock(&ns->bind_lock);
@@ -1196,9 +1250,10 @@ static int named_swap_release(struct inode *inode, struct file *file)
 static long named_swap_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
 	long ret = vfs_fallocate(named_swap_lower(file), mode, offset, len);
-	if (ret) {
-		printk(KERN_ERR "named_swap_fallocate: vfs_fallocate failed: file=%px mode=%d offset=%llu len=%llu ret=%ld\n", file, mode, offset, len, ret);
-	}
+	if (ret)
+		pr_warn_ratelimited("named_swap_fallocate: vfs_fallocate failed: mode=%d offset=%llu len=%llu ret=%ld\n",
+				    mode, (unsigned long long)offset,
+				    (unsigned long long)len, ret);
 	file->f_inode->i_size = named_swap_lower(file)->f_inode->i_size; // update size of wrapper file to match lower file
 	return ret;
 }
@@ -1301,6 +1356,7 @@ static int named_swap_cache_root_inode(void)
 
 static int named_swap_enable_locked(void)
 {
+	const struct cred *old;
 	int ret;
 
 	WRITE_ONCE(named_swap_enabled, false);
@@ -1311,22 +1367,25 @@ static int named_swap_enable_locked(void)
 	atomic64_set(&named_swap_index_counter, 0);
 	named_swap_xa_destroy();
 
+	old = override_creds(&init_cred);
 	ret = named_swap_wipe_dir(named_swap_root);
 	if (ret == -ENOENT)
 		ret = 0;
 	if (ret)
-		return ret;
+		goto out;
 
 	ret = named_swap_mkdir(named_swap_root, 0700);
 	if (ret)
-		return ret;
+		goto out;
 
 	ret = named_swap_cache_root_inode();
 	if (ret)
-		return ret;
+		goto out;
 
 	WRITE_ONCE(named_swap_enabled, true);
-	return 0;
+out:
+	revert_creds(old);
+	return ret;
 }
 
 static int named_swap_ensure_enabled(void)
@@ -1362,10 +1421,17 @@ static struct file *named_swap_create_file(unsigned long len)
 	struct named_swap_file *ns;
 	u64 index;
 	int ret;
+	const struct cred *old;
 
 	ret = named_swap_ensure_enabled();
 	if (ret) {
-		printk(KERN_ERR "named_swap_create_file: failed to ensure enabled");
+		/*
+		 * Root is often still ROFS during early userspace. Fall back
+		 * to anonymous memory until the filesystem is writable.
+		 */
+		if (ret != -EROFS)
+			pr_warn_ratelimited("named_swap: enable failed (%d)\n",
+					    ret);
 		return ERR_PTR(ret);
 	}
 
@@ -1389,15 +1455,17 @@ static struct file *named_swap_create_file(unsigned long len)
 		goto out;
 	}
 
+	old = override_creds(&init_cred);
 	lower = filp_open(path, O_CREAT | O_EXCL | O_RDWR | O_LARGEFILE, 0600);
+	revert_creds(old);
 	if (IS_ERR(lower)) {
 		long err = PTR_ERR(lower);
 
-		printk(KERN_ERR
-		       "named_swap_create_file: filp_open failed: path=%s err=%ld flags=0%o pid=%d comm=%s len=%lu file_index=%llu\n",
-		       path, err, O_CREAT | O_EXCL | O_RDWR | O_LARGEFILE,
-		       current->pid, current->comm,
-		       len, index);
+		if (err != -EACCES && err != -EROFS && err != -EEXIST)
+			pr_warn_ratelimited(
+				"named_swap_create_file: filp_open failed: path=%s err=%ld pid=%d comm=%s len=%lu file_index=%llu\n",
+				path, err, current->pid, current->comm, len,
+				index);
 		file = lower;
 		goto out;
 	}
@@ -1434,7 +1502,10 @@ static struct file *named_swap_create_file(unsigned long len)
 	ret = vfs_fallocate(file, FALLOC_FL_ZERO_RANGE, 0, len);
 	if (ret) {
 		trace_named_swap_file_create(file, index, len, ret);
-		printk(KERN_ERR "named_swap_create_file: vfs_fallocate failed: file=%px len=%lu ret=%d\n", file, len, ret);
+		if (ret != -EOPNOTSUPP && ret != -EROFS)
+			pr_warn_ratelimited(
+				"named_swap_create_file: vfs_fallocate failed: len=%lu ret=%d\n",
+				len, ret);
 		fput(file);
 		file = ERR_PTR(ret);
 		goto out;
@@ -1462,10 +1533,8 @@ struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag) {
 
 	struct file *file = named_swap_create_file(len);
 	
-	if (IS_ERR(file)){
-		printk(KERN_ERR "named_swap_prepare_mmap: failed to create file (falling back to anon memory): file=%px len=%lu\n", file, len);
+	if (IS_ERR(file))
 		return NULL;
-	}
 	if (flag)
 		*flag |= MAP_NAMED_SWAP;
 	return file;

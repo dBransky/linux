@@ -481,7 +481,17 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	if (!new)
 		return -ENOMEM;
 
-	if (new_below) {
+	if (vma_is_named_swap_growsdown(vma)) {
+		pgoff_t lower_pgoff = vma->vm_pgoff +
+			((vma->vm_end - addr) >> PAGE_SHIFT);
+
+		if (new_below) {
+			new->vm_end = addr;
+			new->vm_pgoff = lower_pgoff;
+		} else {
+			new->vm_start = addr;
+		}
+	} else if (new_below) {
 		new->vm_end = addr;
 	} else {
 		new->vm_start = addr;
@@ -515,7 +525,14 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	vma_prepare(&vp);
 	vma_adjust_trans_huge(vma, vma->vm_start, addr, 0);
 
-	if (new_below) {
+	if (vma_is_named_swap_growsdown(vma)) {
+		if (new_below) {
+			vma->vm_start = addr;
+		} else {
+			vma->vm_pgoff += (new->vm_end - addr) >> PAGE_SHIFT;
+			vma->vm_end = addr;
+		}
+	} else if (new_below) {
 		vma->vm_start = addr;
 		vma->vm_pgoff += (addr - new->vm_start) >> PAGE_SHIFT;
 	} else {
@@ -2504,10 +2521,13 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		vma = vma_merge_new_range(&vmg);
 	}
 
-	/* ...if succeeded - fput the original named swap file - we dont need it... */
-	if (vma){
+	/*
+	 * Merge used the adjacent VMA's file. Drop the xarray pin on the
+	 * unused prepared file; vm_mmap_pgoff() still fputs the caller's ref.
+	 */
+	if (vma) {
 		if (file && is_file_named_swap(file))
-			fput(file);
+			named_swap_drop_prepared_file(file);
 	}
 
 	/* ...but if we can't, allocate a new VMA. */
@@ -2974,15 +2994,21 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
 		grow = (vma->vm_start - address) >> PAGE_SHIFT;
 
 		error = -ENOMEM;
-		if (grow <= vma->vm_pgoff) {
+		if (vma_is_named_swap_growsdown(vma) || grow <= vma->vm_pgoff) {
 			error = acct_stack_growth(vma, size, grow);
+			if (!error && vma_is_named_swap_growsdown(vma)) {
+				error = named_swap_enlarge(vma, grow << PAGE_SHIFT);
+				if (error)
+					vm_unacct_memory(grow);
+			}
 			if (!error) {
 				if (vma->vm_flags & VM_LOCKED)
 					mm->locked_vm += grow;
 				vm_stat_account(mm, vma->vm_flags, grow);
 				anon_vma_interval_tree_pre_update_vma(vma);
 				vma->vm_start = address;
-				vma->vm_pgoff -= grow;
+				if (!vma_is_named_swap_growsdown(vma))
+					vma->vm_pgoff -= grow;
 				/* Overwrite old entry in mtree. */
 				vma_iter_store(&vmi, vma);
 				anon_vma_interval_tree_post_update_vma(vma);
