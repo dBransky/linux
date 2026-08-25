@@ -3316,13 +3316,13 @@ static vm_fault_t fault_dirty_shared_page(struct vm_fault *vmf)
 	 * Drop the mmap_lock before waiting on IO, if we can. The file
 	 * is pinning the mapping, as per above.
 	 *
-	 * Named-swap keeps the same dirty balancing as a shared file map
-	 * so background writeback runs before reclaim. First-touch cost
-	 * is dominated by allocating page-cache folios (missing_write),
-	 * not by this throttle — skipping it previously left a reclaim
-	 * cliff of fully-dirty pages on the first cycle.
+	 * Named-swap only throttles in named_swap_flush=file. Modes anon
+	 * and background skip this so the writer does not sleep and does
+	 * not kick background writeback from the fault path.
 	 */
-	if ((dirtied || page_mkwrite) && mapping) {
+	if ((dirtied || page_mkwrite) && mapping &&
+	    (!mapping_named_swap(mapping) ||
+	     named_swap_flush_mode() == NAMED_SWAP_FLUSH_FILE)) {
 		struct file *fpin;
 
 		fpin = maybe_unlock_mmap_for_io(vmf, NULL);

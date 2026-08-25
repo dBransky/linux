@@ -408,7 +408,7 @@ static bool lru_gen_clear_refs(struct folio *folio)
 {
 	struct lru_gen_folio *lrugen;
 	int gen = folio_lru_gen(folio);
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 
 	if (gen < 0)
 		return true;

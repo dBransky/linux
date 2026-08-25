@@ -230,7 +230,7 @@ static void *lru_gen_eviction(struct folio *folio)
 	unsigned long min_seq;
 	struct lruvec *lruvec;
 	struct lru_gen_folio *lrugen;
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	int delta = folio_nr_pages(folio);
 	int refs = folio_lru_refs(folio);
 	bool workingset = folio_test_workingset(folio);
@@ -282,7 +282,8 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
 	unsigned long token;
 	struct lruvec *lruvec;
 	struct lru_gen_folio *lrugen;
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
+	int file = folio_is_file_lru(folio);
 	int delta = folio_nr_pages(folio);
 
 	rcu_read_lock();
@@ -291,7 +292,7 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
 	if (lruvec != folio_lruvec(folio))
 		goto unlock;
 
-	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, delta);
+	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + file, delta);
 
 	if (!recent)
 		goto unlock;
@@ -306,11 +307,11 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
 
 	/* see folio_add_lru() where folio_set_active() will be called */
 	if (lru_gen_in_fault())
-		mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);
+		mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file, delta);
 
 	if (workingset) {
 		folio_set_workingset(folio);
-		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + type, delta);
+		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, delta);
 	} else
 		set_mask_bits(&folio->flags, LRU_REFS_MASK, (refs - 1UL) << LRU_REFS_PGOFF);
 unlock:

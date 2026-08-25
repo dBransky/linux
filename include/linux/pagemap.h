@@ -346,6 +346,11 @@ static inline bool mapping_named_swap(struct address_space *mapping)
 	return test_bit(AS_NAMED_SWAP, &mapping->flags);
 }
 
+static inline int named_swap_flush_mode(void)
+{
+	return READ_ONCE(named_swap_flush);
+}
+
 static inline bool vma_is_named_swap(struct vm_area_struct *vma)
 {
 	if (!vma || !vma->vm_file)

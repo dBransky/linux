@@ -30,6 +30,28 @@ static inline int folio_is_file_lru(struct folio *folio)
 	return !folio_test_swapbacked(folio);
 }
 
+#ifdef CONFIG_LRU_GEN
+static inline int folio_lru_gen_type(struct folio *folio)
+{
+	if (folio_test_named_swap(folio))
+		return LRU_GEN_NAMED;
+	return folio_is_file_lru(folio);
+}
+
+static inline enum lru_list lru_gen_type_inactive_lru(int type)
+{
+	return type == LRU_GEN_ANON ? LRU_INACTIVE_ANON : LRU_INACTIVE_FILE;
+}
+
+static inline bool lru_gen_type_evictable(int type, int swappiness)
+{
+	if (type == LRU_GEN_FILE)
+		return swappiness <= MAX_SWAPPINESS;
+	/* ANON and NAMED are the working-set / swap-like types. */
+	return swappiness > MIN_SWAPPINESS;
+}
+#endif
+
 static inline int page_is_file_lru(struct page *page)
 {
 	return folio_is_file_lru(page_folio(page));
@@ -174,10 +196,11 @@ static inline bool lru_gen_is_active(struct lruvec *lruvec, int gen)
 static inline void lru_gen_update_size(struct lruvec *lruvec, struct folio *folio,
 				       int old_gen, int new_gen)
 {
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	int zone = folio_zonenum(folio);
 	int delta = folio_nr_pages(folio);
-	enum lru_list lru = type * LRU_INACTIVE_FILE;
+	enum lru_list lru = folio_is_file_lru(folio) ? LRU_INACTIVE_FILE :
+						      LRU_INACTIVE_ANON;
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 
 	VM_WARN_ON_ONCE(old_gen != -1 && old_gen >= MAX_NR_GENS);
@@ -221,7 +244,7 @@ static inline unsigned long lru_gen_folio_seq(struct lruvec *lruvec, struct foli
 					      bool reclaiming)
 {
 	int gen;
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 
 	/*
@@ -255,7 +278,7 @@ static inline bool lru_gen_add_folio(struct lruvec *lruvec, struct folio *folio,
 	unsigned long seq;
 	unsigned long flags;
 	int gen = folio_lru_gen(folio);
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	int zone = folio_zonenum(folio);
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 

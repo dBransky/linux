@@ -419,6 +419,8 @@ struct page_vma_mapped_walk;
 enum {
 	LRU_GEN_ANON,
 	LRU_GEN_FILE,
+	LRU_GEN_NAMED,
+	NR_LRU_GEN_TYPES
 };
 
 enum {
@@ -439,13 +441,12 @@ enum {
 #endif
 
 /*
- * The youngest generation number is stored in max_seq for both anon and file
- * types as they are aged on an equal footing. The oldest generation numbers are
- * stored in min_seq[] separately for anon and file types so that they can be
- * incremented independently. Ideally min_seq[] are kept in sync when both anon
- * and file types are evictable. However, to adapt to situations like extreme
- * swappiness, they are allowed to be out of sync by at most
- * MAX_NR_GENS-MIN_NR_GENS-1.
+ * The youngest generation number is stored in max_seq for anon, file, and
+ * named-swap types as they are aged on an equal footing. The oldest generation
+ * numbers are stored in min_seq[] separately so that they can be incremented
+ * independently. Ideally min_seq[] are kept in sync when all evictable types
+ * are scanned. However, to adapt to situations like extreme swappiness, they
+ * are allowed to be out of sync by at most MAX_NR_GENS-MIN_NR_GENS-1.
  *
  * The number of pages in each generation is eventually consistent and therefore
  * can be transiently negative when reset_batch_size() is pending.
@@ -454,22 +455,22 @@ struct lru_gen_folio {
 	/* the aging increments the youngest generation number */
 	unsigned long max_seq;
 	/* the eviction increments the oldest generation numbers */
-	unsigned long min_seq[ANON_AND_FILE];
+	unsigned long min_seq[NR_LRU_GEN_TYPES];
 	/* the birth time of each generation in jiffies */
 	unsigned long timestamps[MAX_NR_GENS];
 	/* the multi-gen LRU lists, lazily sorted on eviction */
-	struct list_head folios[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	struct list_head folios[MAX_NR_GENS][NR_LRU_GEN_TYPES][MAX_NR_ZONES];
 	/* the multi-gen LRU sizes, eventually consistent */
-	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	long nr_pages[MAX_NR_GENS][NR_LRU_GEN_TYPES][MAX_NR_ZONES];
 	/* the exponential moving average of refaulted */
-	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
+	unsigned long avg_refaulted[NR_LRU_GEN_TYPES][MAX_NR_TIERS];
 	/* the exponential moving average of evicted+protected */
-	unsigned long avg_total[ANON_AND_FILE][MAX_NR_TIERS];
+	unsigned long avg_total[NR_LRU_GEN_TYPES][MAX_NR_TIERS];
 	/* can only be modified under the LRU lock */
-	unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	unsigned long protected[NR_HIST_GENS][NR_LRU_GEN_TYPES][MAX_NR_TIERS];
 	/* can be modified without holding the LRU lock */
-	atomic_long_t evicted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
-	atomic_long_t refaulted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	atomic_long_t evicted[NR_HIST_GENS][NR_LRU_GEN_TYPES][MAX_NR_TIERS];
+	atomic_long_t refaulted[NR_HIST_GENS][NR_LRU_GEN_TYPES][MAX_NR_TIERS];
 	/* whether the multi-gen LRU is enabled */
 	bool enabled;
 	/* the memcg generation this lru_gen_folio belongs to */
@@ -512,7 +513,7 @@ struct lru_gen_mm_walk {
 	/* the next address within an mm to scan */
 	unsigned long next_addr;
 	/* to batch promoted pages */
-	int nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	int nr_pages[MAX_NR_GENS][NR_LRU_GEN_TYPES][MAX_NR_ZONES];
 	/* to batch the mm stats */
 	int mm_stats[NR_MM_STATS];
 	/* total batched items */

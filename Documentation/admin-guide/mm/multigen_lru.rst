@@ -110,9 +110,9 @@ histograms are noncumulative.
 
     memcg  memcg_id  memcg_path
        node  node_id
-           min_gen_nr  age_in_ms  nr_anon_pages  nr_file_pages
+           min_gen_nr  age_in_ms  nr_anon_pages  nr_file_pages  nr_named_pages
            ...
-           max_gen_nr  age_in_ms  nr_anon_pages  nr_file_pages
+           max_gen_nr  age_in_ms  nr_anon_pages  nr_file_pages  nr_named_pages
 
 Each bin contains an estimated number of pages that have been accessed
 within ``age_in_ms``. E.g., ``min_gen_nr`` contains the coldest pages

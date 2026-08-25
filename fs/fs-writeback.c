@@ -1933,6 +1933,20 @@ static long writeback_sb_inodes(struct super_block *sb,
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
+		/*
+		 * named_swap_flush=anon: leave named-swap dirty until
+		 * reclaim (WB_REASON_VMSCAN) or sync asks. Periodic,
+		 * background, and start_all flushers (WB_REASON_PERIODIC
+		 * has neither for_kupdate nor for_background) skip them.
+		 */
+		if (work->sync_mode != WB_SYNC_ALL &&
+		    work->reason != WB_REASON_VMSCAN &&
+		    named_swap_flush_mode() == NAMED_SWAP_FLUSH_ANON &&
+		    mapping_named_swap(inode->i_mapping)) {
+			redirty_tail_locked(inode, wb);
+			spin_unlock(&inode->i_lock);
+			continue;
+		}
 		if ((inode->i_state & I_SYNC) && wbc.sync_mode != WB_SYNC_ALL) {
 			/*
 			 * If this inode is locked for writeback and we are not

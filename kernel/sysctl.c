@@ -2094,6 +2094,15 @@ static const struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_named_swap_root,
 	},
+	{
+		.procname	= "named_swap_flush",
+		.data		= &named_swap_flush,
+		.maxlen		= sizeof(named_swap_flush),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_TWO,
+	},
 #ifdef CONFIG_NUMA
 	{
 		.procname	= "numa_stat",

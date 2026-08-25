@@ -991,8 +991,15 @@ enum named_swap_reclaim_result {
 	NAMED_SWAP_RECLAIM_DEMOTE,
 };
 
+enum {
+	NAMED_SWAP_FLUSH_ANON = 0,
+	NAMED_SWAP_FLUSH_BACKGROUND = 1,
+	NAMED_SWAP_FLUSH_FILE = 2,
+};
+
 extern int named_swap_min_vma_size;
 extern int named_swap_debug;
+extern int named_swap_flush;
 
 #define NAMED_SWAP_DBG_HIST	0x01	/* record enlarge/shrink ring */
 #define NAMED_SWAP_DBG_PRINT	0x02	/* printk every resize */

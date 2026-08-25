@@ -427,6 +427,26 @@ static atomic64_t named_swap_index_counter = ATOMIC64_INIT(0);
 int named_swap_min_vma_size = 256; /* 256 pages = 1MB */
 EXPORT_SYMBOL_GPL(named_swap_min_vma_size);
 
+/* Default matches today's file writeback + dirty throttle. */
+int named_swap_flush = NAMED_SWAP_FLUSH_FILE;
+EXPORT_SYMBOL_GPL(named_swap_flush);
+
+static int __init named_swap_flush_setup(char *str)
+{
+	int mode;
+
+	if (!str || kstrtoint(str, 0, &mode) ||
+	    mode < NAMED_SWAP_FLUSH_ANON || mode > NAMED_SWAP_FLUSH_FILE) {
+		pr_warn("named_swap.flush: invalid value '%s', keeping %d\n",
+			str ? str : "", named_swap_flush);
+		return 0;
+	}
+	named_swap_flush = mode;
+	pr_info("named_swap.flush: using %d\n", named_swap_flush);
+	return 1;
+}
+__setup("named_swap.flush=", named_swap_flush_setup);
+
 static int named_swap_cache_root_inode(void);
 
 static int named_swap_validate_root(const char *path)
@@ -1701,7 +1721,7 @@ named_swap_seq_classify(struct folio *folio, struct lruvec *lruvec,
 		return NAMED_SWAP_SEQ_WRONG_LRUVEC;
 	if (folio_zonenum(folio) != zone)
 		return NAMED_SWAP_SEQ_WRONG_ZONE;
-	if (folio_is_file_lru(folio) != type)
+	if (folio_lru_gen_type(folio) != type)
 		return NAMED_SWAP_SEQ_WRONG_TYPE;
 	if (folio_lru_gen(folio) != gen)
 		return NAMED_SWAP_SEQ_WRONG_GEN;

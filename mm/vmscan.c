@@ -1452,6 +1452,7 @@ retry:
 			 * flag set).
 			 */
 			if (folio_is_file_lru(folio) &&
+			    !folio_test_named_swap(folio) &&
 			    (!current_is_kswapd() ||
 			     !folio_test_reclaim(folio) ||
 			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
@@ -2766,21 +2767,32 @@ static bool should_clear_pmd_young(void)
 	unsigned long max_seq = READ_ONCE((lruvec)->lrugen.max_seq)
 
 #define DEFINE_MIN_SEQ(lruvec)						\
-	unsigned long min_seq[ANON_AND_FILE] = {			\
+	unsigned long min_seq[NR_LRU_GEN_TYPES] = {			\
 		READ_ONCE((lruvec)->lrugen.min_seq[LRU_GEN_ANON]),	\
 		READ_ONCE((lruvec)->lrugen.min_seq[LRU_GEN_FILE]),	\
+		READ_ONCE((lruvec)->lrugen.min_seq[LRU_GEN_NAMED]),	\
 	}
 
-#define evictable_min_seq(min_seq, swappiness)				\
-	min((min_seq)[!(swappiness)], (min_seq)[(swappiness) <= MAX_SWAPPINESS])
+static inline unsigned long evictable_min_seq(unsigned long *min_seq,
+					      int swappiness)
+{
+	unsigned long seq = ULONG_MAX;
+
+	if (swappiness)
+		seq = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_NAMED]);
+	if (swappiness <= MAX_SWAPPINESS)
+		seq = min(seq, min_seq[LRU_GEN_FILE]);
+	return seq;
+}
 
 #define for_each_gen_type_zone(gen, type, zone)				\
 	for ((gen) = 0; (gen) < MAX_NR_GENS; (gen)++)			\
-		for ((type) = 0; (type) < ANON_AND_FILE; (type)++)	\
+		for ((type) = 0; (type) < NR_LRU_GEN_TYPES; (type)++)	\
 			for ((zone) = 0; (zone) < MAX_NR_ZONES; (zone)++)
 
 #define for_each_evictable_type(type, swappiness)			\
-	for ((type) = !(swappiness); (type) <= ((swappiness) <= MAX_SWAPPINESS); (type)++)
+	for ((type) = 0; (type) < NR_LRU_GEN_TYPES; (type)++)		\
+		if (lru_gen_type_evictable((type), (swappiness)))
 
 #define get_memcg_gen(seq)	((seq) % MEMCG_NR_GENS)
 #define get_memcg_bin(bin)	((bin) % MEMCG_NR_BINS)
@@ -2829,7 +2841,7 @@ static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)
 {
 	int type;
 
-	for (type = 0; type < ANON_AND_FILE; type++) {
+	for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
 		int n = get_nr_gens(lruvec, type);
 
 		if (n < MIN_NR_GENS || n > MAX_NR_GENS)
@@ -3332,7 +3344,7 @@ static int folio_update_gen(struct folio *folio, int gen)
 /* protect pages accessed multiple times through file descriptors */
 static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
 {
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
 	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
@@ -3362,7 +3374,7 @@ static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclai
 static void update_batch_size(struct lru_gen_mm_walk *walk, struct folio *folio,
 			      int old_gen, int new_gen)
 {
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	int zone = folio_zonenum(folio);
 	int delta = folio_nr_pages(folio);
 
@@ -3384,7 +3396,7 @@ static void reset_batch_size(struct lru_gen_mm_walk *walk)
 	walk->batched = 0;
 
 	for_each_gen_type_zone(gen, type, zone) {
-		enum lru_list lru = type * LRU_INACTIVE_FILE;
+		enum lru_list lru = lru_gen_type_inactive_lru(type);
 		int delta = walk->nr_pages[gen][type][zone];
 
 		if (!delta)
@@ -3432,6 +3444,9 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
 		return true;
 
 	if (shmem_mapping(mapping))
+		return !walk->swappiness;
+
+	if (mapping_named_swap(mapping))
 		return !walk->swappiness;
 
 	if (walk->swappiness > MAX_SWAPPINESS)
@@ -3932,7 +3947,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, int swappiness)
 	int hist = lru_hist_from_seq(lrugen->min_seq[type]);
 	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
 
-	if (type ? swappiness > MAX_SWAPPINESS : !swappiness)
+	if (!lru_gen_type_evictable(type, swappiness))
 		goto done;
 
 	/* prevent cold/hot inversion if the type is evictable */
@@ -3946,7 +3961,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, int swappiness)
 
 			VM_WARN_ON_ONCE_FOLIO(folio_test_unevictable(folio), folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_test_active(folio), folio);
-			VM_WARN_ON_ONCE_FOLIO(folio_is_file_lru(folio) != type, folio);
+			VM_WARN_ON_ONCE_FOLIO(folio_lru_gen_type(folio) != type, folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
 
 			new_gen = folio_inc_gen(lruvec, folio, false);
@@ -4000,11 +4015,24 @@ next:
 	/* see the comment on lru_gen_folio */
 	if (swappiness && swappiness <= MAX_SWAPPINESS) {
 		unsigned long seq = lrugen->max_seq - MIN_NR_GENS;
+		bool any_behind = false;
+		bool any_ahead = false;
 
-		if (min_seq[LRU_GEN_ANON] > seq && min_seq[LRU_GEN_FILE] < seq)
-			min_seq[LRU_GEN_ANON] = seq;
-		else if (min_seq[LRU_GEN_FILE] > seq && min_seq[LRU_GEN_ANON] < seq)
-			min_seq[LRU_GEN_FILE] = seq;
+		for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
+			if (!lru_gen_type_evictable(type, swappiness))
+				continue;
+			if (min_seq[type] < seq)
+				any_behind = true;
+			if (min_seq[type] > seq)
+				any_ahead = true;
+		}
+		if (any_ahead && any_behind) {
+			for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
+				if (lru_gen_type_evictable(type, swappiness) &&
+				    min_seq[type] > seq)
+					min_seq[type] = seq;
+			}
+		}
 	}
 
 	for_each_evictable_type(type, swappiness) {
@@ -4037,7 +4065,7 @@ restart:
 	if (!success)
 		goto unlock;
 
-	for (type = 0; type < ANON_AND_FILE; type++) {
+	for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
 		if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
 			continue;
 
@@ -4058,9 +4086,9 @@ restart:
 	prev = lru_gen_from_seq(lrugen->max_seq - 1);
 	next = lru_gen_from_seq(lrugen->max_seq + 1);
 
-	for (type = 0; type < ANON_AND_FILE; type++) {
+	for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
 		for (zone = 0; zone < MAX_NR_ZONES; zone++) {
-			enum lru_list lru = type * LRU_INACTIVE_FILE;
+			enum lru_list lru = lru_gen_type_inactive_lru(type);
 			long delta = lrugen->nr_pages[prev][type][zone] -
 				     lrugen->nr_pages[next][type][zone];
 
@@ -4072,7 +4100,7 @@ restart:
 		}
 	}
 
-	for (type = 0; type < ANON_AND_FILE; type++)
+	for (type = 0; type < NR_LRU_GEN_TYPES; type++)
 		reset_ctrl_pos(lruvec, type, false);
 
 	WRITE_ONCE(lrugen->timestamps[next], jiffies);
@@ -4504,7 +4532,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	bool success;
 	bool dirty, writeback;
 	int gen = folio_lru_gen(folio);
-	int type = folio_is_file_lru(folio);
+	int type = folio_lru_gen_type(folio);
 	int zone = folio_zonenum(folio);
 	int delta = folio_nr_pages(folio);
 	int refs = folio_lru_refs(folio);
@@ -4554,14 +4582,14 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 
 	dirty = folio_test_dirty(folio);
 	writeback = folio_test_writeback(folio);
-	if (type == LRU_GEN_FILE && dirty) {
+	if (type != LRU_GEN_ANON && dirty) {
 		sc->nr.file_taken += delta;
 		if (!writeback)
 			sc->nr.unqueued_dirty += delta;
 	}
 
 	/* waiting for writeback */
-	if (writeback || (type == LRU_GEN_FILE && dirty)) {
+	if (writeback || (type != LRU_GEN_ANON && dirty)) {
 		int old_gen = gen;
 
 		gen = folio_inc_gen(lruvec, folio, true);
@@ -4646,7 +4674,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 
 			VM_WARN_ON_ONCE_FOLIO(folio_test_unevictable(folio), folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_test_active(folio), folio);
-			VM_WARN_ON_ONCE_FOLIO(folio_is_file_lru(folio) != type, folio);
+			VM_WARN_ON_ONCE_FOLIO(folio_lru_gen_type(folio) != type, folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
 
 			scanned += delta;
@@ -4806,11 +4834,13 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 	}
 	__count_memcg_events(memcg, item, isolated);
 	__count_memcg_events(memcg, PGREFILL, sorted);
-	__count_vm_events(PGSCAN_ANON + type, isolated);
+	__count_vm_events(type == LRU_GEN_ANON ? PGSCAN_ANON : PGSCAN_FILE,
+			  isolated);
 	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, MAX_LRU_BATCH,
 				scanned, skipped, isolated,
-				type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
-	if (type == LRU_GEN_FILE)
+				type == LRU_GEN_ANON ? LRU_INACTIVE_ANON :
+						       LRU_INACTIVE_FILE);
+	if (type != LRU_GEN_ANON)
 		sc->nr.file_taken += isolated;
 	/*
 	 * There might not be eligible folios due to reclaim_idx. Check the
@@ -4847,15 +4877,15 @@ static int get_type_to_scan(struct lruvec *lruvec, int swappiness)
 		return LRU_GEN_FILE;
 
 	if (swappiness >= MAX_SWAPPINESS)
-		return LRU_GEN_ANON;
+		return LRU_GEN_NAMED;
 	/*
-	 * Compare the sum of all tiers of anon with that of file to determine
-	 * which type to scan.
+	 * Named-swap is the default-on working set. Compare it with file
+	 * using the same swappiness gain that anon used to take.
 	 */
-	read_ctrl_pos(lruvec, LRU_GEN_ANON, MAX_NR_TIERS, swappiness, &sp);
+	read_ctrl_pos(lruvec, LRU_GEN_NAMED, MAX_NR_TIERS, swappiness, &sp);
 	read_ctrl_pos(lruvec, LRU_GEN_FILE, MAX_NR_TIERS, MAX_SWAPPINESS - swappiness, &pv);
 
-	return positive_ctrl_err(&sp, &pv);
+	return positive_ctrl_err(&sp, &pv) ? LRU_GEN_NAMED : LRU_GEN_FILE;
 }
 
 static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int swappiness,
@@ -4863,18 +4893,30 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 {
 	int i;
 	int type = get_type_to_scan(lruvec, swappiness);
+	int order[NR_LRU_GEN_TYPES];
+	int n = 0;
 
-	for_each_evictable_type(i, swappiness) {
+	*type_scanned = type;
+	order[n++] = type;
+	if (type == LRU_GEN_NAMED)
+		order[n++] = LRU_GEN_FILE;
+	else if (type == LRU_GEN_FILE)
+		order[n++] = LRU_GEN_NAMED;
+	order[n++] = LRU_GEN_ANON;
+
+	for (i = 0; i < n; i++) {
 		int scanned;
-		int tier = get_tier_idx(lruvec, type);
+		int tier;
+		int t = order[i];
 
-		*type_scanned = type;
+		if (!lru_gen_type_evictable(t, swappiness))
+			continue;
 
-		scanned = scan_folios(lruvec, sc, type, tier, list);
+		*type_scanned = t;
+		tier = get_tier_idx(lruvec, t);
+		scanned = scan_folios(lruvec, sc, t, tier, list);
 		if (scanned)
 			return scanned;
-
-		type = !type;
 	}
 
 	return 0;
@@ -4924,7 +4966,8 @@ retry:
 	sc->nr_reclaimed += reclaimed;
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
 			scanned, reclaimed, &stat, sc->priority,
-			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+			type == LRU_GEN_ANON ? LRU_INACTIVE_ANON :
+					       LRU_INACTIVE_FILE);
 
 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
 		DEFINE_MIN_SEQ(lruvec);
@@ -4964,7 +5007,8 @@ retry:
 	if (!cgroup_reclaim(sc))
 		__count_vm_events(item, reclaimed);
 	__count_memcg_events(memcg, item, reclaimed);
-	__count_vm_events(PGSTEAL_ANON + type, reclaimed);
+	__count_vm_events(type == LRU_GEN_ANON ? PGSTEAL_ANON : PGSTEAL_FILE,
+			  reclaimed);
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
@@ -5351,7 +5395,7 @@ static bool drain_evictable(struct lruvec *lruvec)
 
 			VM_WARN_ON_ONCE_FOLIO(folio_test_unevictable(folio), folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_test_active(folio), folio);
-			VM_WARN_ON_ONCE_FOLIO(folio_is_file_lru(folio) != type, folio);
+			VM_WARN_ON_ONCE_FOLIO(folio_lru_gen_type(folio) != type, folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
 
 			success = lru_gen_del_folio(lruvec, folio, false);
@@ -5565,7 +5609,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
 
 	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
 		seq_printf(m, "            %10d", tier);
-		for (type = 0; type < ANON_AND_FILE; type++) {
+		for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
 			const char *s = "xxx";
 			unsigned long n[3] = {};
 
@@ -5645,7 +5689,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
 
 		seq_printf(m, " %10lu %10u", seq, jiffies_to_msecs(jiffies - birth));
 
-		for (type = 0; type < ANON_AND_FILE; type++) {
+		for (type = 0; type < NR_LRU_GEN_TYPES; type++) {
 			unsigned long size = 0;
 			char mark = full && seq < min_seq[type] ? 'x' : ' ';
 
