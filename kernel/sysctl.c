@@ -85,6 +85,8 @@
 const int sysctl_vals[] = { 0, 1, 2, 3, 4, 100, 200, 1000, 3000, INT_MAX, 65535, -1 };
 EXPORT_SYMBOL(sysctl_vals);
 
+static int named_swap_fs_free_max = 99;
+
 const unsigned long sysctl_long_vals[] = { 0, 1, LONG_MAX };
 EXPORT_SYMBOL_GPL(sysctl_long_vals);
 
@@ -2093,6 +2095,115 @@ static const struct ctl_table vm_table[] = {
 		.maxlen		= NAMED_SWAP_PATH_LEN,
 		.mode		= 0644,
 		.proc_handler	= proc_named_swap_root,
+	},
+	{
+		.procname	= "named_swap_fs_root",
+		.data		= named_swap_fs_root,
+		.maxlen		= NAMED_SWAP_PATH_LEN,
+		.mode		= 0644,
+		.proc_handler	= proc_named_swap_fs_root,
+	},
+	{
+		.procname	= "named_swap_device",
+		.data		= named_swap_device,
+		.maxlen		= NAMED_SWAP_PATH_LEN,
+		.mode		= 0644,
+		.proc_handler	= proc_named_swap_device,
+	},
+	{
+		.procname	= "named_swap_mode",
+		.data		= named_swap_device,
+		.maxlen		= 16,
+		.mode		= 0644,
+		.proc_handler	= proc_named_swap_mode,
+	},
+	{
+		.procname	= "named_swap_fs_free",
+		.data		= &named_swap_fs_free,
+		.maxlen		= sizeof(named_swap_fs_free),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &named_swap_fs_free_max,
+	},
+	{
+		.procname	= "named_swap_freerun",
+		.data		= &named_swap_freerun,
+		.maxlen		= sizeof(named_swap_freerun),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "named_swap_storage",
+		.maxlen		= 512,
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_storage,
+	},
+	{
+		.procname	= "named_swap_swap_usage",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_SWAP,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_USAGE,
+	},
+	{
+		.procname	= "named_swap_swap_free",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_SWAP,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_FREE,
+	},
+	{
+		.procname	= "named_swap_swap_total",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_SWAP,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_TOTAL,
+	},
+	{
+		.procname	= "named_swap_swap_hard",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_SWAP,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_HARD,
+	},
+	{
+		.procname	= "named_swap_fs_usage",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_FS,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_USAGE,
+	},
+	{
+		.procname	= "named_swap_fs_avail",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_FS,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_FREE,
+	},
+	{
+		.procname	= "named_swap_fs_total",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_FS,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_TOTAL,
+	},
+	{
+		.procname	= "named_swap_fs_hard",
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444,
+		.proc_handler	= proc_named_swap_pool_stat,
+		.extra1		= (void *)(unsigned long)NAMED_SWAP_POOL_FS,
+		.extra2		= (void *)(unsigned long)NAMED_SWAP_POOL_STAT_HARD,
 	},
 	{
 		.procname	= "named_swap_flush",

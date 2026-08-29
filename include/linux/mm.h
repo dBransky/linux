@@ -997,6 +997,24 @@ enum {
 	NAMED_SWAP_FLUSH_FILE = 2,
 };
 
+enum named_swap_storage_mode {
+	NAMED_SWAP_STORAGE_FS,
+	NAMED_SWAP_STORAGE_SWAP,
+	NAMED_SWAP_STORAGE_HYBRID,
+};
+
+enum named_swap_storage_pool {
+	NAMED_SWAP_POOL_SWAP,
+	NAMED_SWAP_POOL_FS,
+};
+
+enum named_swap_pool_stat {
+	NAMED_SWAP_POOL_STAT_USAGE,
+	NAMED_SWAP_POOL_STAT_FREE,
+	NAMED_SWAP_POOL_STAT_TOTAL,
+	NAMED_SWAP_POOL_STAT_HARD,
+};
+
 extern int named_swap_min_vma_size;
 extern int named_swap_debug;
 extern int named_swap_flush;
@@ -1007,10 +1025,41 @@ extern int named_swap_flush;
 #define NAMED_SWAP_DBG_ASSERT	0x08	/* i_size / fault-past-EOF */
 #define NAMED_SWAP_DBG_STACK	0x10	/* dump_stack on each resize */
 extern char named_swap_root[NAMED_SWAP_PATH_LEN];
+extern char named_swap_fs_root[NAMED_SWAP_PATH_LEN];
+extern char named_swap_device[NAMED_SWAP_PATH_LEN];
+extern int named_swap_fs_free;
+extern int named_swap_freerun;
 int proc_named_swap_root(const struct ctl_table *table, int write,
 			 void *buffer, size_t *lenp, loff_t *ppos);
+int proc_named_swap_fs_root(const struct ctl_table *table, int write,
+			    void *buffer, size_t *lenp, loff_t *ppos);
+int proc_named_swap_device(const struct ctl_table *table, int write,
+			   void *buffer, size_t *lenp, loff_t *ppos);
+int proc_named_swap_mode(const struct ctl_table *table, int write,
+			 void *buffer, size_t *lenp, loff_t *ppos);
+int proc_named_swap_storage(const struct ctl_table *table, int write,
+			    void *buffer, size_t *lenp, loff_t *ppos);
+int proc_named_swap_pool_stat(const struct ctl_table *table, int write,
+			      void *buffer, size_t *lenp, loff_t *ppos);
+int named_swap_storage_setup(void);
+int named_swap_storage_reserve(unsigned long pages,
+			       enum named_swap_storage_pool *chosen);
+int named_swap_storage_reserve_pool(unsigned long pages,
+				    enum named_swap_storage_pool pool);
+void named_swap_storage_release(unsigned long pages,
+				enum named_swap_storage_pool pool);
+int named_swap_storage_build_path(u64 index, enum named_swap_storage_pool pool,
+				  char *path, size_t len);
+bool named_swap_storage_pool_used(enum named_swap_storage_pool pool);
+const char *named_swap_storage_pool_dir(enum named_swap_storage_pool pool);
+const char *named_swap_storage_primary_dir(void);
+enum named_swap_storage_mode named_swap_storage_mode(void);
 unsigned long named_swap_total_pages(void);
-struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag);
+struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag,
+				     bool allocate);
+int named_swap_uncommit(struct vm_area_struct *vma);
+int named_swap_allocate_vma(struct vm_area_struct *vma,
+			    unsigned long start, unsigned long end);
 char *named_swap_file_path(struct file *file, char *buf, int buflen);
 void named_swap_link(struct vm_area_struct *vma);
 void named_swap_unlink(struct anon_vma *anon_vma);

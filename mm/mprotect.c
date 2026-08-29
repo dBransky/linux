@@ -681,7 +681,16 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
 	vma_set_page_prot(vma);
 
-	change_protection(tlb, vma, start, end, mm_cp_flags);
+	if (vma_is_named_swap(vma) && (oldflags & VM_ACCESS_FLAGS) &&
+	    !(newflags & VM_ACCESS_FLAGS)) {
+		/* Zap PTEs only. PROT_NONE does not shrink i_size. */
+		unmap_page_range(tlb, vma, start, end, NULL);
+	} else {
+		change_protection(tlb, vma, start, end, mm_cp_flags);
+		if (vma_is_named_swap(vma) && !(oldflags & VM_ACCESS_FLAGS) &&
+		    (newflags & VM_ACCESS_FLAGS))
+			named_swap_allocate_vma(vma, start, end);
+	}
 
 	if ((oldflags & VM_ACCOUNT) && !(newflags & VM_ACCOUNT))
 		vm_unacct_memory(nrpages);
@@ -897,7 +906,6 @@ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
 	ret = pkey;
 out:
 	mmap_write_unlock(current->mm);
-	named_swap_fs_flush();
 	return ret;
 }
 
@@ -908,7 +916,6 @@ SYSCALL_DEFINE1(pkey_free, int, pkey)
 	mmap_write_lock(current->mm);
 	ret = mm_pkey_free(current->mm, pkey);
 	mmap_write_unlock(current->mm);
-	named_swap_fs_flush();
 
 	/*
 	 * We could provide warnings or errors if any VMA still

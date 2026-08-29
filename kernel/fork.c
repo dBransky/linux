@@ -635,6 +635,7 @@ struct named_swap_fork_file {
 	unsigned long start;
 	unsigned long end;
 	pgoff_t pgoff;
+	bool allocate;
 	struct file *child_file;
 	struct file *parent_file;
 };
@@ -714,6 +715,7 @@ static int named_swap_prepare_fork_files(struct mm_struct *oldmm,
 			file->start = vma->vm_start;
 			file->end = vma->vm_end;
 			file->pgoff = vma->vm_pgoff;
+			file->allocate = !!(vma->vm_flags & VM_ACCESS_FLAGS);
 		}
 	}
 
@@ -724,18 +726,39 @@ unlock:
 		goto out_free;
 
 	for (i = 0; i < prepared->nr; i++) {
-		unsigned long len = prepared->files[i].end -
-				    prepared->files[i].start;
+		unsigned long vma_len = prepared->files[i].end -
+					prepared->files[i].start;
+		loff_t need;
+		unsigned long len;
 		struct file *file;
 
-		file = named_swap_prepare_mmap(len, NULL);
+		/*
+		 * Split/mprotect leaves vm_pgoff at the window's file
+		 * offset. The new parent/child files must cover that
+		 * offset plus the VMA length, not only vm_end-vm_start.
+		 */
+		need = ((loff_t)prepared->files[i].pgoff << PAGE_SHIFT) +
+		       vma_len;
+		if (need < 0 || (loff_t)(unsigned long)need != need) {
+			ret = -EFBIG;
+			goto out_free;
+		}
+		len = (unsigned long)need;
+
+		file = named_swap_prepare_mmap(len, NULL,
+					       prepared->files[i].allocate);
+		if (IS_ERR_OR_NULL(file) && prepared->files[i].allocate)
+			file = named_swap_prepare_mmap(len, NULL, false);
 		if (IS_ERR_OR_NULL(file)) {
 			ret = file ? PTR_ERR(file) : -ENOMEM;
 			goto out_free;
 		}
 		prepared->files[i].child_file = file;
 
-		file = named_swap_prepare_mmap(len, NULL);
+		file = named_swap_prepare_mmap(len, NULL,
+					       prepared->files[i].allocate);
+		if (IS_ERR_OR_NULL(file) && prepared->files[i].allocate)
+			file = named_swap_prepare_mmap(len, NULL, false);
 		if (IS_ERR_OR_NULL(file)) {
 			ret = file ? PTR_ERR(file) : -ENOMEM;
 			goto out_free;
@@ -769,22 +792,60 @@ named_swap_next_fork_file(struct named_swap_fork_files *prepared,
 	return file;
 }
 
+/*
+ * Must be called with oldmm's mmap write lock held. Prepare snapshots
+ * VMAs under a read lock, then drops it to create files. Concurrent
+ * mmap/munmap can change start/end/pgoff before dup_mmap takes the
+ * write lock.
+ */
+static bool named_swap_fork_files_stale(struct mm_struct *mm,
+					struct named_swap_fork_files *prepared)
+{
+	struct vm_area_struct *vma;
+	unsigned int i = 0;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	for_each_vma(vmi, vma) {
+		if (!vma_needs_named_swap_fork_file(vma))
+			continue;
+		if (i >= prepared->nr)
+			return true;
+		if (prepared->files[i].start != vma->vm_start ||
+		    prepared->files[i].end != vma->vm_end ||
+		    prepared->files[i].pgoff != vma->vm_pgoff)
+			return true;
+		i++;
+	}
+	return i != prepared->nr;
+}
+
+#define NAMED_SWAP_FORK_PREPARE_RETRIES 8
+
 static __latent_entropy int dup_mmap(struct mm_struct *mm,
 					struct mm_struct *oldmm)
 {
 	struct vm_area_struct *mpnt, *tmp;
 	int retval;
+	int named_swap_tries = 0;
 	unsigned long charge = 0;
 	struct named_swap_fork_files prepared_named_swap;
 	LIST_HEAD(uf);
 	VMA_ITERATOR(vmi, mm, 0);
 
+retry_named_swap:
 	retval = named_swap_prepare_fork_files(oldmm, &prepared_named_swap);
 	if (retval)
 		return retval;
 
 	if (mmap_write_lock_killable(oldmm))
 		goto fail_named_swap_prepare;
+	if (named_swap_fork_files_stale(oldmm, &prepared_named_swap)) {
+		mmap_write_unlock(oldmm);
+		named_swap_fork_files_put(&prepared_named_swap);
+		if (++named_swap_tries < NAMED_SWAP_FORK_PREPARE_RETRIES)
+			goto retry_named_swap;
+		return -EAGAIN;
+	}
 	flush_cache_dup_mm(oldmm);
 	uprobe_dup_mmap(oldmm, mm);
 	/*
@@ -862,6 +923,46 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 			hugetlb_dup_vma_private(tmp);
 
 		/*
+		 * Attach named-swap files before storing tmp. Failure
+		 * must use the not-yet-counted __mt_dup slot (same as
+		 * fail_nomem_*). Storing first then goto loop_out would
+		 * overwrite a counted VMA with XA_ZERO_ENTRY and trip
+		 * exit_mmap's map_count BUG_ON.
+		 */
+		file = tmp->vm_file;
+		if (file && mapping_named_swap(file->f_mapping)) {
+			struct file *orig_file = file;
+			struct named_swap_fork_file *prepared;
+
+			prepared = named_swap_next_fork_file(&prepared_named_swap,
+							     mpnt);
+			if (IS_ERR(prepared)) {
+				retval = PTR_ERR(prepared);
+				goto fail_named_swap_vma;
+			}
+			tmp->vm_file = prepared->child_file;
+			prepared->child_file = NULL;
+			if (anon_vma_prepare_exclusive(tmp)) {
+				fput(tmp->vm_file);
+				tmp->vm_file = orig_file;
+				retval = -ENOMEM;
+				goto fail_named_swap_vma;
+			}
+			named_swap_link(tmp);
+			mpnt->vm_file = prepared->parent_file;
+			prepared->parent_file = NULL;
+			if (anon_vma_prepare_exclusive(mpnt)) {
+				fput(mpnt->vm_file);
+				mpnt->vm_file = orig_file;
+				fput(tmp->vm_file);
+				tmp->vm_file = orig_file;
+				retval = -ENOMEM;
+				goto fail_named_swap_vma;
+			}
+			named_swap_link(mpnt);
+		}
+
+		/*
 		 * Link the vma into the MT. After using __mt_dup(), memory
 		 * allocation is not necessary here, so it cannot fail.
 		 */
@@ -873,46 +974,19 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 			tmp->vm_ops->open(tmp);
 
 		file = tmp->vm_file;
-		if (file) {
+		if (file && !mapping_named_swap(file->f_mapping)) {
 			struct address_space *mapping = file->f_mapping;
-			if (mapping_named_swap(mapping))
-			{
-				struct named_swap_fork_file *prepared;
 
-				prepared = named_swap_next_fork_file(&prepared_named_swap,
-								     mpnt);
-				if (IS_ERR(prepared)) {
-					retval = PTR_ERR(prepared);
-					goto loop_out;
-				}
-				tmp->vm_file = prepared->child_file;
-				prepared->child_file = NULL;
-				if (anon_vma_prepare_exclusive(tmp)) {
-					retval = -ENOMEM;
-					goto loop_out;
-				}
-				named_swap_link(tmp);
-				//now the parent also has a new anon_vma, so we need to create a new file and link it
-				mpnt->vm_file = prepared->parent_file;
-				prepared->parent_file = NULL;
-				if (anon_vma_prepare_exclusive(mpnt)) {
-					retval = -ENOMEM;
-					goto loop_out;
-				}
-				named_swap_link(mpnt);
-			}
-			else {
-				get_file(file);
-				i_mmap_lock_write(mapping);
-				if (vma_is_shared_maywrite(tmp))
-					mapping_allow_writable(mapping);
-				flush_dcache_mmap_lock(mapping);
-				/* insert tmp into the share list, just after mpnt */
-				vma_interval_tree_insert_after(tmp, mpnt,
-						&mapping->i_mmap);
-				flush_dcache_mmap_unlock(mapping);
-				i_mmap_unlock_write(mapping);
-			}
+			get_file(file);
+			i_mmap_lock_write(mapping);
+			if (vma_is_shared_maywrite(tmp))
+				mapping_allow_writable(mapping);
+			flush_dcache_mmap_lock(mapping);
+			/* insert tmp into the share list, just after mpnt */
+			vma_interval_tree_insert_after(tmp, mpnt,
+					&mapping->i_mmap);
+			flush_dcache_mmap_unlock(mapping);
+			i_mmap_unlock_write(mapping);
 		}
 
 		if (!(tmp->vm_flags & VM_WIPEONFORK))
@@ -964,6 +1038,13 @@ out:
 	named_swap_fork_files_put(&prepared_named_swap);
 	return retval;
 
+fail_named_swap_vma:
+	if (tmp->anon_vma)
+		unlink_anon_vmas(tmp);
+	mpol_put(vma_policy(tmp));
+	vm_area_free(tmp);
+	vm_unacct_memory(charge);
+	goto loop_out;
 fail_nomem_anon_vma_fork:
 	mpol_put(vma_policy(tmp));
 fail_nomem_policy:
