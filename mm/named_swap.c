@@ -45,6 +45,11 @@
 #undef CREATE_TRACE_POINTS
 #include <linux/mm_inline.h>
 #include <linux/memcontrol.h>
+#include <linux/huge_mm.h>
+#include <linux/highmem.h>
+#include <linux/pagewalk.h>
+#include <linux/buffer_head.h>
+#include <linux/backing-dev.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/sort.h>
@@ -1818,3 +1823,543 @@ struct folio *named_swap_seq_next(struct address_space *mapping,
 		return NULL;
 	return next;
 }
+*pmd) || pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
+		split_huge_pmd(walk->vma, pmd, addr);
+	return 0;
+}
+
+static const struct mm_walk_ops named_swap_convert_split_ops = {
+	.pmd_entry	= named_swap_convert_split_pmd,
+	.walk_lock	= PGWALK_WRLOCK_VERIFY,
+};
+
+static pmd_t *named_swap_convert_pmd(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d))
+		return NULL;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud))
+		return NULL;
+	return pmd_offset(pud, addr);
+}
+
+static int named_swap_convert_populate(struct vm_area_struct *vma)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long addr;
+	unsigned int flags = 0;
+
+	if (!(vma->vm_flags & VM_ACCESS_FLAGS))
+		return 0;
+
+	if (vma->vm_flags & VM_WRITE)
+		flags |= FAULT_FLAG_WRITE;
+
+	for (addr = vma->vm_start; addr < vma->vm_end; addr += PAGE_SIZE) {
+		pmd_t *pmd = named_swap_convert_pmd(mm, addr);
+		bool need_fault = true;
+		vm_fault_t fault;
+
+		if (pmd && !pmd_none(*pmd) && !pmd_trans_huge(*pmd) &&
+		    !is_swap_pmd(*pmd) && !pmd_devmap(*pmd)) {
+			pte_t *ptep = pte_offset_map(pmd, addr);
+
+			if (ptep) {
+				if (pte_present(ptep_get(ptep)))
+					need_fault = false;
+				pte_unmap(ptep);
+			}
+		}
+		if (!need_fault)
+			continue;
+
+		fault = handle_mm_fault(vma, addr, flags, NULL);
+		if (fault & VM_FAULT_ERROR)
+			return vm_fault_to_errno(fault, 0);
+	}
+	return 0;
+}
+
+static bool named_swap_anon_vma_has_other(struct vm_area_struct *skip)
+{
+	struct mm_struct *mm = skip->vm_mm;
+	struct vm_area_struct *tmp;
+	struct anon_vma *anon_vma = skip->anon_vma;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	if (!anon_vma)
+		return false;
+
+	for_each_vma(vmi, tmp) {
+		if (tmp == skip)
+			continue;
+		if (vma_is_named_swap(tmp) && tmp->anon_vma == anon_vma)
+			return true;
+	}
+	return false;
+}
+
+static void named_swap_convert_unbind_file(struct vm_area_struct *vma,
+					   struct file *file)
+{
+	vma->vm_file = NULL;
+	vma_set_anonymous(vma);
+	if (vma->anon_vma && vma->anon_vma->named_swap_file == file &&
+	    !named_swap_anon_vma_has_other(vma))
+		named_swap_unlink(vma->anon_vma);
+	if (file)
+		fput(file);
+}
+
+static bool named_swap_pte_still_maps(pte_t pte, struct page *page)
+{
+	return pte_present(pte) && !is_zero_pfn(pte_pfn(pte)) &&
+	       pfn_valid(pte_pfn(pte)) && pte_page(pte) == page;
+}
+
+static void named_swap_convert_rss(struct mm_struct *mm, int old, int new)
+{
+	if (old == new)
+		return;
+	dec_mm_counter(mm, old);
+	inc_mm_counter(mm, new);
+}
+
+static bool named_swap_folio_off_lru(struct folio *folio)
+{
+	/*
+	 * folio_add_lru() only queues on this CPU. A local drain leaves
+	 * the folio in another CPU's batch with PG_lru clear, so isolate
+	 * fails and a second folio_add_lru() double-queues it. The later
+	 * drain hits VM_BUG_ON_FOLIO(folio_test_lru) in lru_add().
+	 */
+	lru_add_drain_all();
+	return folio_isolate_lru(folio);
+}
+
+static void named_swap_folio_on_lru(struct folio *folio, bool isolated)
+{
+	if (isolated)
+		folio_putback_lru(folio);
+	/*
+	 * Do not folio_add_lru() when isolate failed. The folio is still
+	 * in a remote add batch, already isolated by reclaim, or was
+	 * never on the LRU. A second queue is what trips lru_add().
+	 */
+}
+
+static int named_swap_folio_lock_split(struct folio **foliop, struct page *page)
+{
+	struct folio *folio = *foliop;
+	int err;
+
+	folio_lock(folio);
+	if (folio_test_writeback(folio)) {
+		folio_unlock(folio);
+		folio_wait_writeback(folio);
+		folio_lock(folio);
+	}
+
+	if (!folio_test_large(folio))
+		return 0;
+
+	/*
+	 * split_huge_page accounts only the folio lock as an extra pin.
+	 * Drop the caller's reference for the split, then restore it on
+	 * the resulting order-0 folio.
+	 */
+	folio_put(folio);
+	err = split_folio(folio);
+	if (err) {
+		folio_unlock(folio);
+		folio_get(page_folio(page));
+		return err;
+	}
+	folio = page_folio(page);
+	folio_get(folio);
+	*foliop = folio;
+	return 0;
+}
+
+static void named_swap_folio_detach_file(struct folio *folio)
+{
+	if (folio_needs_release(folio))
+		folio_invalidate(folio, 0, folio_size(folio));
+	folio_cancel_dirty(folio);
+	if (folio_has_private(folio))
+		filemap_release_folio(folio, GFP_KERNEL);
+}
+
+static void named_swap_folio_prepare_writeback(struct folio *folio)
+{
+	struct address_space *mapping = folio->mapping;
+	unsigned int blocksize;
+
+	if (!folio_test_uptodate(folio))
+		folio_mark_uptodate(folio);
+	if (!mapping || !mapping->host || !mapping_can_writeback(mapping))
+		return;
+	if (folio_buffers(folio))
+		return;
+	blocksize = 1U << mapping->host->i_blkbits;
+	if (!blocksize)
+		return;
+	create_empty_buffers(folio, blocksize, (1 << BH_Uptodate));
+}
+
+static void named_swap_restore_anon_rmap(struct folio *folio, struct page *page,
+					 struct vm_area_struct *vma,
+					 unsigned long addr)
+{
+	__folio_set_swapbacked(folio);
+	folio->index = linear_page_index(vma, addr);
+	folio_move_anon_rmap(folio, vma);
+	folio_add_anon_rmap_pte(folio, page, vma, addr, RMAP_EXCLUSIVE);
+}
+
+static int named_swap_folio_to_anon(struct vm_area_struct *vma,
+				    unsigned long addr, struct folio *folio,
+				    struct page *page)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pmd_t *pmd;
+	pte_t *ptep;
+	spinlock_t *ptl;
+	int old_rss;
+	bool isolated;
+	int err;
+
+	err = named_swap_folio_lock_split(&folio, page);
+	if (err)
+		return err;
+
+	old_rss = mm_counter(folio);
+	isolated = named_swap_folio_off_lru(folio);
+
+	pmd = named_swap_convert_pmd(mm, addr);
+	if (!pmd) {
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep || !named_swap_pte_still_maps(ptep_get(ptep), page)) {
+		if (ptep)
+			pte_unmap_unlock(ptep, ptl);
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	folio_remove_rmap_pte(folio, page, vma);
+	pte_unmap_unlock(ptep, ptl);
+
+	if (folio_mapped(folio) || folio_test_anon(folio) || !folio->mapping) {
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (ptep) {
+			folio_add_file_rmap_pte(folio, page, vma);
+			pte_unmap_unlock(ptep, ptl);
+		}
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	named_swap_folio_detach_file(folio);
+	filemap_remove_folio(folio);
+
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep || !named_swap_pte_still_maps(ptep_get(ptep), page)) {
+		if (ptep)
+			pte_unmap_unlock(ptep, ptl);
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+	named_swap_convert_rss(mm, old_rss, mm_counter(folio));
+	pte_unmap_unlock(ptep, ptl);
+	named_swap_folio_on_lru(folio, isolated);
+	folio_unlock(folio);
+	return 0;
+}
+
+static int named_swap_folio_to_file(struct vm_area_struct *vma,
+				    unsigned long addr, struct folio *folio,
+				    struct page *page)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct address_space *mapping = vma->vm_file->f_mapping;
+	pgoff_t index = linear_page_index(vma, addr);
+	pmd_t *pmd;
+	pte_t *ptep;
+	spinlock_t *ptl;
+	int old_rss;
+	bool isolated;
+	int err;
+
+	err = named_swap_folio_lock_split(&folio, page);
+	if (err)
+		return err;
+
+	old_rss = mm_counter(folio);
+	isolated = named_swap_folio_off_lru(folio);
+
+	pmd = named_swap_convert_pmd(mm, addr);
+	if (!pmd) {
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep || !named_swap_pte_still_maps(ptep_get(ptep), page)) {
+		if (ptep)
+			pte_unmap_unlock(ptep, ptl);
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	folio_remove_rmap_pte(folio, page, vma);
+	pte_unmap_unlock(ptep, ptl);
+
+	ClearPageAnonExclusive(page);
+	folio_clear_swapbacked(folio);
+	folio->mapping = NULL;
+	err = __filemap_add_folio(mapping, folio, index, GFP_KERNEL, NULL);
+	if (err) {
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (ptep) {
+			named_swap_restore_anon_rmap(folio, page, vma, addr);
+			pte_unmap_unlock(ptep, ptl);
+		}
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return err;
+	}
+
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep || !named_swap_pte_still_maps(ptep_get(ptep), page)) {
+		if (ptep)
+			pte_unmap_unlock(ptep, ptl);
+		filemap_remove_folio(folio);
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (ptep) {
+			if (named_swap_pte_still_maps(ptep_get(ptep), page))
+				named_swap_restore_anon_rmap(folio, page, vma,
+							     addr);
+			pte_unmap_unlock(ptep, ptl);
+		}
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	pte_unmap_unlock(ptep, ptl);
+
+	/*
+	 * create_empty_buffers() may sleep. Do it after dropping the
+	 * PTE lock; re-check the PTE before installing file rmap.
+	 */
+	named_swap_folio_prepare_writeback(folio);
+
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep || !named_swap_pte_still_maps(ptep_get(ptep), page)) {
+		if (ptep)
+			pte_unmap_unlock(ptep, ptl);
+		filemap_remove_folio(folio);
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (ptep) {
+			if (named_swap_pte_still_maps(ptep_get(ptep), page))
+				named_swap_restore_anon_rmap(folio, page, vma,
+							     addr);
+			pte_unmap_unlock(ptep, ptl);
+		}
+		named_swap_folio_on_lru(folio, isolated);
+		folio_unlock(folio);
+		return -EBUSY;
+	}
+	folio_add_file_rmap_pte(folio, page, vma);
+	folio_mark_dirty(folio);
+	{
+		pte_t pte = ptep_get(ptep);
+
+		pte = pte_mkdirty(pte);
+		pte = maybe_mkwrite(pte, vma);
+		set_pte_at(mm, addr, ptep, pte);
+		update_mmu_cache(vma, addr, ptep);
+	}
+	named_swap_convert_rss(mm, old_rss, mm_counter(folio));
+	pte_unmap_unlock(ptep, ptl);
+	named_swap_folio_on_lru(folio, isolated);
+	folio_unlock(folio);
+	return 0;
+}
+
+static int named_swap_convert_ptes(struct vm_area_struct *vma, bool to_named_swap)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long addr;
+	int err = 0;
+
+	for (addr = vma->vm_start; addr < vma->vm_end; addr += PAGE_SIZE) {
+		spinlock_t *ptl;
+		pte_t *ptep;
+		pte_t pte;
+		struct folio *folio;
+		struct page *page;
+		pmd_t *pmd;
+
+		pmd = named_swap_convert_pmd(mm, addr);
+		if (!pmd || pmd_none(*pmd))
+			continue;
+
+		ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+		if (!ptep)
+			continue;
+		pte = ptep_get(ptep);
+		if (!pte_present(pte) || is_zero_pfn(pte_pfn(pte))) {
+			pte_unmap_unlock(ptep, ptl);
+			continue;
+		}
+		page = vm_normal_page(vma, addr, pte);
+		if (!page) {
+			pte_unmap_unlock(ptep, ptl);
+			continue;
+		}
+		folio = page_folio(page);
+		folio_get(folio);
+		pte_unmap_unlock(ptep, ptl);
+
+		if (to_named_swap) {
+			if (!folio_test_anon(folio)) {
+				folio_put(folio);
+				continue;
+			}
+			if (folio_mapcount(folio) != 1) {
+				folio_put(folio);
+				err = -EBUSY;
+				break;
+			}
+			err = named_swap_folio_to_file(vma, addr, folio, page);
+		} else {
+			if (!folio_test_named_swap(folio)) {
+				folio_put(folio);
+				continue;
+			}
+			if (folio_mapcount(folio) != 1) {
+				folio_put(folio);
+				err = -EBUSY;
+				break;
+			}
+			err = named_swap_folio_to_anon(vma, addr, folio, page);
+		}
+		folio_put(folio);
+		if (err)
+			break;
+	}
+	return err;
+}
+
+static int named_swap_convert_to_anon(struct vm_area_struct *vma)
+{
+	struct file *file = vma->vm_file;
+	int err;
+
+	if (!vma_is_named_swap(vma))
+		return 0;
+
+	err = named_swap_convert_populate(vma);
+	if (err)
+		return err;
+
+	if (anon_vma_prepare(vma))
+		return -ENOMEM;
+
+	vma_start_write(vma);
+	named_swap_convert_unbind_file(vma, file);
+	return named_swap_convert_ptes(vma, false);
+}
+
+static int named_swap_convert_to_named(struct vm_area_struct *vma)
+{
+	struct file *file;
+	unsigned long vma_len = vma->vm_end - vma->vm_start;
+	loff_t need;
+	unsigned long len;
+	int err;
+
+	if (vma_is_named_swap(vma))
+		return 0;
+	if (vma->vm_file)
+		return -EINVAL;
+
+	err = named_swap_convert_populate(vma);
+	if (err)
+		return err;
+
+	if (anon_vma_prepare(vma))
+		return -ENOMEM;
+
+	need = ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + vma_len;
+	if (need < 0 || (loff_t)(unsigned long)need != need)
+		return -EFBIG;
+	len = (unsigned long)need;
+
+	file = named_swap_prepare_mmap(len, NULL);
+	if (IS_ERR_OR_NULL(file))
+		return file ? PTR_ERR(file) : -ENOMEM;
+
+	vma_start_write(vma);
+	vma->vm_file = get_file(file);
+	err = mmap_file(file, vma);
+	if (err) {
+		fput(vma->vm_file);
+		vma->vm_file = NULL;
+		vma_set_anonymous(vma);
+		fput(file);
+		return err;
+	}
+	named_swap_link(vma);
+	err = named_swap_convert_ptes(vma, true);
+	fput(file);
+	if (err) {
+		struct file *drop = vma->vm_file;
+
+		named_swap_convert_unbind_file(vma, drop);
+	}
+	return err;
+}
+
+int named_swap_convert_vma(struct vm_area_struct *vma, bool to_named_swap)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	int err;
+
+	mmap_assert_write_locked(mm);
+
+	if (!can_modify_vma(vma))
+		return -EINVAL;
+	if (is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_SHARED))
+		return -EINVAL;
+	if (vma->vm_file && !vma_is_named_swap(vma))
+		return -EINVAL;
+
+	if (to_named_swap == vma_is_named_swap(vma))
+		return 0;
+
+	vma_start_write(vma);
+	err = walk_page_vma(vma, &named_swap_convert_split_ops, NULL);
+	if (err)
+		return err;
+
+	if (to_named_swap)
+		return named_swap_convert_to_named(vma);
+	return named_swap_convert_to_anon(vma);
+}
+EXPORT_SYMBOL_GPL(named_swap_convert_vma);
+

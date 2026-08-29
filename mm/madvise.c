@@ -1333,6 +1333,26 @@ static int madvise_vma_behavior(struct vm_area_struct *vma,
 		return madvise_guard_install(vma, prev, start, end);
 	case MADV_GUARD_REMOVE:
 		return madvise_guard_remove(vma, prev, start, end);
+	case MADV_NAMED_SWAP:
+	case MADV_NO_NAMED_SWAP: {
+		VMA_ITERATOR(vmi, vma->vm_mm, start);
+
+		if (!can_modify_vma(vma))
+			return -EINVAL;
+		if (is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_SHARED))
+			return -EINVAL;
+		if (vma->vm_file && !vma_is_named_swap(vma))
+			return -EINVAL;
+
+		vma = vma_modify_flags(&vmi, *prev, vma, start, end,
+				       vma->vm_flags);
+		if (IS_ERR(vma))
+			return PTR_ERR(vma);
+		*prev = NULL;
+		error = named_swap_convert_vma(vma,
+					       behavior == MADV_NAMED_SWAP);
+		goto out;
+	}
 	}
 
 	anon_name = anon_vma_name(vma);
@@ -1434,6 +1454,8 @@ madvise_behavior_valid(int behavior)
 	case MADV_KEEPONFORK:
 	case MADV_GUARD_INSTALL:
 	case MADV_GUARD_REMOVE:
+	case MADV_NAMED_SWAP:
+	case MADV_NO_NAMED_SWAP:
 #ifdef CONFIG_MEMORY_FAILURE
 	case MADV_SOFT_OFFLINE:
 	case MADV_HWPOISON:

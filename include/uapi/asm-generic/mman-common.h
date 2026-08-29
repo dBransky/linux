@@ -79,6 +79,9 @@
 
 #define MADV_COLLAPSE	25		/* Synchronous hugepage collapse */
 
+#define MADV_NAMED_SWAP		26	/* convert range to named-swap */
+#define MADV_NO_NAMED_SWAP	27	/* convert range to ordinary anonymous */
+
 #define MADV_GUARD_INSTALL 102		/* fatal signal on access to range */
 #define MADV_GUARD_REMOVE 103		/* unguard range */
 

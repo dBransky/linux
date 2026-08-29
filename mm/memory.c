@@ -3910,6 +3910,14 @@ void unmap_mapping_folio(struct folio *folio)
 	details.single_folio = folio;
 	details.zap_flags = ZAP_FLAG_DROP_MARKER;
 
+	/*
+	 * Named-swap stores anon_vma in the i_mmap union. Walking that
+	 * word as a VMA interval tree oopses (rb_node set, rb_leftmost
+	 * NULL). Pages are unmapped via anon rmap, not i_mmap.
+	 */
+	if (!mapping || mapping_named_swap(mapping))
+		return;
+
 	i_mmap_lock_read(mapping);
 	if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root)))
 		unmap_mapping_range_tree(&mapping->i_mmap, first_index,
@@ -3939,6 +3947,9 @@ void unmap_mapping_pages(struct address_space *mapping, pgoff_t start,
 	details.even_cows = even_cows;
 	if (last_index < first_index)
 		last_index = ULONG_MAX;
+
+	if (mapping_named_swap(mapping))
+		return;
 
 	i_mmap_lock_read(mapping);
 	if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root)))

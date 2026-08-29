@@ -587,6 +587,12 @@ static inline void i_mmap_assert_write_locked(struct address_space *mapping)
  */
 static inline int mapping_mapped(struct address_space *mapping)
 {
+	/*
+	 * Named-swap reuses i_mmap as anon_vma (AS_NAMED_SWAP = 9 in
+	 * pagemap.h). A non-NULL rb_node is not a VMA interval tree.
+	 */
+	if (mapping->flags & (1UL << 9))
+		return 0;
 	return	!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root);
 }
 
