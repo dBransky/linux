@@ -15,6 +15,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
 #include <linux/cred.h>
+#include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/dcache.h>
 #include <linux/falloc.h>
@@ -23,17 +24,11 @@
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/fsnotify.h>
-#include <linux/init.h>
-#include <linux/debugfs.h>
 #include <linux/hash.h>
-#include <linux/ktime.h>
-#include <linux/ptrace.h>
-#include <linux/sched/debug.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
-#include <linux/highmem.h>
+#include <linux/init.h>
 #include <linux/init_task.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/limits.h>
 #include <linux/math.h>
 #include <linux/magic.h>
@@ -41,10 +36,14 @@
 #include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/overflow.h>
+#include <linux/ptrace.h>
 #include <linux/rmap.h>
+#include <linux/sched/debug.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysctl.h>
+#include <linux/uaccess.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
@@ -61,6 +60,12 @@
 #include <linux/pagewalk.h>
 #include <linux/buffer_head.h>
 #include <linux/backing-dev.h>
+#include <linux/bitmap.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/sched/mm.h>
+#include <linux/sort.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 /*
@@ -70,26 +75,36 @@
 struct named_swap_file {
 	struct file *lower;
 	spinlock_t bind_lock;
+	/*
+	 * Mutex, not a spinlock: VFS sync must run while this is held so a
+	 * concurrent set_size cannot publish a new i_size that a stale
+	 * truncate then destroys. mmap-side set_size takes this after mmap
+	 * write; sync takes it without mmap. That order does not invert.
+	 */
+	struct mutex size_lock;
 	u64 index;
 	unsigned long nr_pages;
-	struct mutex size_lock;
-	u64 size_gen;
-	bool holes_dirty;
-	loff_t vfs_size;
 	enum named_swap_storage_pool pool;
+	u64 size_gen;
+	bool artifact;
+	bool holes_dirty;
+	/* Last size successfully applied to the lower file via VFS. */
+	loff_t vfs_size;
+	struct work_struct punch_work;
+	struct file *punch_file;
+	unsigned long *punch_keep;
+	unsigned long punch_npages;
 };
 
 static DEFINE_XARRAY(named_swap_files);
 static DEFINE_MUTEX(named_swap_xa_lock);
 
-enum named_swap_resize_op {
-	NAMED_SWAP_RESIZE_ENLARGE,
-	NAMED_SWAP_RESIZE_SHRINK,
-	NAMED_SWAP_RESIZE_DEALLOC,
-	NAMED_SWAP_RESIZE_UNCOMMIT,
-	NAMED_SWAP_RESIZE_ALLOC,
-};
-
+/*
+ * Last N enlarge/shrink/uncommit ops. Dump on user SIGSEGV so we can
+ * see which VMA/file was resized before V8 walked a zero Map.
+ * Default: hist + SIGSEGV dump + asserts. Print-every-resize is off
+ * (Cursor mmaps make it unreadable).
+ */
 int named_swap_debug = NAMED_SWAP_DBG_HIST | NAMED_SWAP_DBG_SEGV |
 		       NAMED_SWAP_DBG_ASSERT;
 EXPORT_SYMBOL_GPL(named_swap_debug);
@@ -135,18 +150,6 @@ static const char *named_swap_resize_name(u32 op)
 	}
 }
 
-static loff_t named_swap_debug_isize(struct file *file)
-{
-	struct file *lower;
-
-	if (!file)
-		return -EINVAL;
-	lower = named_swap_lower(file);
-	if (!lower)
-		return -EINVAL;
-	return i_size_read(file_inode(lower));
-}
-
 static u64 named_swap_vma_index(struct vm_area_struct *vma)
 {
 	u64 index = NAMED_SWAP_INDEX_NONE;
@@ -167,6 +170,9 @@ static void named_swap_hist_record(struct vm_area_struct *vma,
 
 	if (!vma)
 		return;
+
+	trace_named_swap_resize(vma, op, addr, delta, old_size, new_size,
+				index, ret);
 
 	if (named_swap_debug & NAMED_SWAP_DBG_PRINT)
 		pr_info("named_swap %s pid=%d comm=%s vma=%lx-%lx flags=%lx pgoff=%lx addr=%lx delta=%lu old=%lld new=%lld index=%llu ret=%d\n",
@@ -199,6 +205,27 @@ static void named_swap_hist_record(struct vm_area_struct *vma,
 	e->index = index;
 }
 
+static void named_swap_assert_vma_size(struct vm_area_struct *vma,
+				       const char *what)
+{
+	loff_t need, sz;
+
+	if (!(named_swap_debug & NAMED_SWAP_DBG_ASSERT) || !vma ||
+	    !vma_is_named_swap(vma))
+		return;
+
+	need = ((loff_t)vma->vm_pgoff << PAGE_SHIFT) +
+	       (vma->vm_end - vma->vm_start);
+	sz = named_swap_file_size(vma->vm_file);
+	if (sz >= 0 && sz < need) {
+		pr_err("named_swap ASSERT i_size=%lld < vma_need=%lld pid=%d comm=%s vma=%lx-%lx pgoff=%lx index=%llu what=%s\n",
+		       sz, need, current->pid, current->comm,
+		       vma->vm_start, vma->vm_end, vma->vm_pgoff,
+		       named_swap_vma_index(vma), what);
+		dump_stack();
+	}
+}
+
 void named_swap_check_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma;
@@ -207,10 +234,10 @@ void named_swap_check_fault(struct vm_fault *vmf)
 	if (!(named_swap_debug & NAMED_SWAP_DBG_ASSERT) || !vmf || !vmf->vma)
 		return;
 	vma = vmf->vma;
-	if (!vma_is_named_swap(vma) || !vma->vm_file)
+	if (!vma_is_named_swap(vma))
 		return;
 	off = (loff_t)linear_page_index(vma, vmf->address) << PAGE_SHIFT;
-	sz = named_swap_debug_isize(vma->vm_file);
+	sz = named_swap_file_size(vma->vm_file);
 	if (sz >= 0 && off >= sz) {
 		pr_err("named_swap ASSERT fault past i_size pid=%d comm=%s addr=%lx off=%lld i_size=%lld vma=%lx-%lx pgoff=%lx index=%llu\n",
 		       current->pid, current->comm, vmf->address, off, sz,
@@ -226,6 +253,7 @@ static void named_swap_debug_dump_vma(const char *tag, unsigned long addr,
 {
 	u64 index = NAMED_SWAP_INDEX_NONE;
 	loff_t isz = -1;
+	pgoff_t pgoff = 0;
 
 	if (!vma) {
 		pr_err("named_swap %s addr=%lx vma=NULL\n", tag, addr);
@@ -233,12 +261,76 @@ static void named_swap_debug_dump_vma(const char *tag, unsigned long addr,
 	}
 	if (vma->vm_file) {
 		named_swap_file_index(vma->vm_file, &index);
-		isz = named_swap_debug_isize(vma->vm_file);
+		isz = named_swap_file_size(vma->vm_file);
 	}
-	pr_err("named_swap %s addr=%lx vma=%px %lx-%lx flags=%lx pgoff=%lx index=%llu i_size=%lld named=%d file=%px\n",
+	if (addr >= vma->vm_start && addr < vma->vm_end)
+		pgoff = linear_page_index(vma, addr);
+	pr_err("named_swap %s addr=%lx vma=%px %lx-%lx flags=%lx pgoff=%lx file_off=%lx index=%llu i_size=%lld named=%d file=%px\n",
 	       tag, addr, vma, vma->vm_start, vma->vm_end, vma->vm_flags,
-	       vma->vm_pgoff, index, isz,
+	       vma->vm_pgoff, (unsigned long)pgoff, index, isz,
 	       vma_is_named_swap(vma), vma->vm_file);
+}
+
+static void named_swap_debug_dump_pte(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	spinlock_t *ptl;
+	pte_t *ptep;
+	pte_t pte;
+
+	if (!mm || addr < PAGE_SIZE)
+		return;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd))) {
+		pr_err("named_swap pte addr=%lx pgd_none\n", addr);
+		return;
+	}
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || unlikely(p4d_bad(*p4d))) {
+		pr_err("named_swap pte addr=%lx p4d_none\n", addr);
+		return;
+	}
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || unlikely(pud_bad(*pud))) {
+		pr_err("named_swap pte addr=%lx pud_none\n", addr);
+		return;
+	}
+	if (pud_leaf(*pud)) {
+		pr_err("named_swap pte addr=%lx pud_leaf\n", addr);
+		return;
+	}
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || unlikely(pmd_bad(*pmd))) {
+		pr_err("named_swap pte addr=%lx pmd_none\n", addr);
+		return;
+	}
+	if (pmd_leaf(*pmd)) {
+		pr_err("named_swap pte addr=%lx pmd_leaf pfn=%lx\n",
+		       addr, pmd_pfn(*pmd));
+		return;
+	}
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep) {
+		pr_err("named_swap pte addr=%lx pte_map_fail\n", addr);
+		return;
+	}
+	pte = ptep_get(ptep);
+	if (pte_none(pte))
+		pr_err("named_swap pte addr=%lx none\n", addr);
+	else if (pte_present(pte))
+		pr_err("named_swap pte addr=%lx present val=%lx pfn=%lx write=%d\n",
+		       addr, pte_val(pte), pte_pfn(pte), pte_write(pte));
+	else if (is_named_swap_pte(pte))
+		pr_err("named_swap pte addr=%lx swp_named index=%lu\n",
+		       addr, swp_offset(pte_to_swp_entry(pte)));
+	else
+		pr_err("named_swap pte addr=%lx nonpresent val=%lx\n",
+		       addr, pte_val(pte));
+	pte_unmap_unlock(ptep, ptl);
 }
 
 static void named_swap_debug_dump_hist(pid_t tgid)
@@ -322,6 +414,90 @@ void named_swap_check_zero_read(struct vm_area_struct *vma, unsigned long addr)
 }
 EXPORT_SYMBOL_GPL(named_swap_check_zero_read);
 
+static void named_swap_assert_drop_rw(struct vm_area_struct *drop,
+				      struct file *file, pgoff_t start,
+				      pgoff_t last, const char *what)
+{
+	struct vm_area_struct *tmp;
+	u64 drop_index = NAMED_SWAP_INDEX_NONE;
+	VMA_ITERATOR(vmi, drop ? drop->vm_mm : current->mm, 0);
+
+	if (!(named_swap_debug & NAMED_SWAP_DBG_ASSERT) || !file)
+		return;
+	named_swap_file_index(file, &drop_index);
+	for_each_vma(vmi, tmp) {
+		unsigned long n = vma_pages(tmp);
+		pgoff_t a, b;
+		u64 idx = NAMED_SWAP_INDEX_NONE;
+
+		if (tmp == drop || !n || !tmp->vm_file)
+			continue;
+		if (!(tmp->vm_flags & (VM_READ | VM_WRITE)))
+			continue;
+		if (tmp->vm_file != file) {
+			if (named_swap_file_index(tmp->vm_file, &idx) ||
+			    idx != drop_index)
+				continue;
+		}
+		a = tmp->vm_pgoff;
+		b = a + n - 1;
+		if (a > last || b < start)
+			continue;
+		pr_err("named_swap ASSERT %s overlaps RW vma pid=%d comm=%s drop=%lx-%lx pgoff=%lx-%lx rw=%lx-%lx rw_pgoff=%lx-%lx flags=%lx index=%llu\n",
+		       what, current->pid, current->comm,
+		       drop ? drop->vm_start : 0, drop ? drop->vm_end : 0,
+		       start, last, tmp->vm_start, tmp->vm_end, a, b,
+		       tmp->vm_flags, drop_index);
+		dump_stack();
+	}
+}
+
+static void named_swap_debug_dump_page(unsigned long addr,
+				       struct vm_area_struct *vma)
+{
+	struct folio *folio;
+	u64 index = NAMED_SWAP_INDEX_NONE;
+	pgoff_t pgoff;
+	u8 user[64];
+	u8 kern[64];
+	int n;
+	size_t foff;
+	void *kaddr;
+
+	if (!vma_is_named_swap(vma) || addr < PAGE_SIZE)
+		return;
+	pgoff = linear_page_index(vma, addr);
+	named_swap_file_index(vma->vm_file, &index);
+	n = copy_from_user_nofault(user, (const void __user *)addr, sizeof(user));
+	if (!n)
+		pr_err("named_swap bytes user addr=%lx %*ph\n",
+		       addr, (int)sizeof(user), user);
+	else
+		pr_err("named_swap bytes user addr=%lx copy_fail=%d\n", addr, n);
+
+	folio = filemap_get_folio(vma->vm_file->f_mapping, pgoff);
+	if (IS_ERR(folio)) {
+		pr_err("named_swap folio addr=%lx index=%llu pgoff=%lx cache=absent\n",
+		       addr, index, pgoff);
+		return;
+	}
+	pr_err("named_swap folio addr=%lx index=%llu pgoff=%lx folio_idx=%lx order=%u uptodate=%d dirty=%d writeback=%d mapcount=%d ref=%d\n",
+	       addr, index, pgoff, folio_index(folio), folio_order(folio),
+	       folio_test_uptodate(folio), folio_test_dirty(folio),
+	       folio_test_writeback(folio), folio_mapcount(folio),
+	       folio_ref_count(folio));
+	foff = ((pgoff - folio_index(folio)) << PAGE_SHIFT) +
+	       (addr & ~PAGE_MASK);
+	if (foff + sizeof(kern) <= folio_size(folio)) {
+		kaddr = kmap_local_folio(folio, foff);
+		memcpy(kern, kaddr, sizeof(kern));
+		kunmap_local(kaddr);
+		pr_err("named_swap bytes folio addr=%lx %*ph\n",
+		       addr, (int)sizeof(kern), kern);
+	}
+	folio_put(folio);
+}
+
 int named_swap_hist_show(struct seq_file *m, void *v)
 {
 	u64 seq = atomic64_read(&named_swap_hist_seq);
@@ -350,6 +526,10 @@ void named_swap_debug_user_segv(struct pt_regs *regs, unsigned long address,
 				struct vm_area_struct *vma)
 {
 	static atomic_t dumps;
+	struct mm_struct *mm = current->mm;
+	unsigned long hints[8];
+	unsigned int n = 0, i;
+	bool locked = false;
 	unsigned long ip;
 	u64 index = NAMED_SWAP_INDEX_NONE;
 	int dump_n;
@@ -366,11 +546,57 @@ void named_swap_debug_user_segv(struct pt_regs *regs, unsigned long address,
 	ip = instruction_pointer(regs);
 	if (vma)
 		index = named_swap_vma_index(vma);
+	trace_named_swap_user_segv(address, ip, error_code, si_code, vma, index);
 
-	pr_err("named_swap SEGV #%d pid=%d tgid=%d comm=%s addr=%lx ip=%lx err=0x%lx si=%d index=%llu\n",
+	pr_err("named_swap SEGV #%d pid=%d tgid=%d comm=%s addr=%lx ip=%lx sp=%lx err=0x%lx si=%d\n",
 	       dump_n, current->pid, current->tgid, current->comm,
-	       address, ip, error_code, si_code, index);
+	       address, ip, user_stack_pointer(regs), error_code, si_code);
+#ifdef CONFIG_X86_64
+	pr_err("named_swap SEGV regs di=%lx si=%lx r8=%lx r10=%lx r14=%lx r15=%lx\n",
+	       regs->di, regs->si, regs->r8, regs->r10, regs->r14, regs->r15);
+#endif
+
+	hints[n++] = address;
+	hints[n++] = ip;
+#ifdef CONFIG_X86_64
+	hints[n++] = regs->di;
+	hints[n++] = regs->r8;
+	hints[n++] = regs->r14;
+	hints[n++] = regs->r15 & ~1UL;
+	if (regs->r15 > 1)
+		hints[n++] = (regs->r15 - 1) & PAGE_MASK;
+#endif
+
+	if (!vma && mm && mmap_read_trylock(mm))
+		locked = true;
+
 	named_swap_debug_dump_vma("fault_vma", address, vma);
+	if (vma && address >= vma->vm_start && address < vma->vm_end) {
+		named_swap_debug_dump_pte(vma->vm_mm, address);
+		named_swap_debug_dump_page(address, vma);
+	}
+
+	if (mm && (vma || locked)) {
+		for (i = 0; i < n; i++) {
+			struct vm_area_struct *hit;
+
+			if (!hints[i] || hints[i] < PAGE_SIZE)
+				continue;
+			hit = find_vma(mm, hints[i]);
+			if (!hit || hints[i] < hit->vm_start)
+				continue;
+			if (hit == vma)
+				continue;
+			named_swap_debug_dump_vma("reg_vma", hints[i], hit);
+			if (vma_is_named_swap(hit)) {
+				named_swap_debug_dump_pte(mm, hints[i]);
+				named_swap_debug_dump_page(hints[i], hit);
+			}
+		}
+	}
+	if (locked)
+		mmap_read_unlock(mm);
+
 	named_swap_debug_dump_hist(current->tgid);
 	dump_stack();
 }
@@ -391,7 +617,6 @@ static int __init named_swap_debug_setup(char *str)
 	return 1;
 }
 __setup("named_swap.debug=", named_swap_debug_setup);
-
 
 static struct file *named_swap_file_peek(u64 index);
 
@@ -678,8 +903,9 @@ out_creds:
 	return ret;
 }
 
-static long named_swap_fallocate_lower(struct file *lower, int mode,
-				       loff_t offset, loff_t len)
+static long named_swap_fallocate_lower_gfp(struct file *lower, int mode,
+					   loff_t offset, loff_t len,
+					   bool start_write)
 {
 	struct inode *inode = file_inode(lower);
 	const struct cred *old;
@@ -698,13 +924,21 @@ static long named_swap_fallocate_lower(struct file *lower, int mode,
 		return -EFBIG;
 
 	old = override_creds(&init_cred);
-	file_start_write(lower);
+	if (start_write)
+		file_start_write(lower);
 	ret = lower->f_op->fallocate(lower, mode, offset, len);
 	if (!ret)
 		fsnotify_modify(lower);
-	file_end_write(lower);
+	if (start_write)
+		file_end_write(lower);
 	revert_creds(old);
 	return ret;
+}
+
+static long named_swap_fallocate_lower(struct file *lower, int mode,
+				       loff_t offset, loff_t len)
+{
+	return named_swap_fallocate_lower_gfp(lower, mode, offset, len, true);
 }
 
 static void named_swap_account_unreserve(struct named_swap_file *ns,
@@ -1318,45 +1552,9 @@ int named_swap_deallocate(struct vm_area_struct *vma, unsigned long start,
 }
 
 /*
- * True when another VMA in this mm still maps overlapping file offsets.
- * mremap MAYMOVE installs the dest VMA before unmapping the source; that
- * munmap must not punch or shrink the file the dest still owns.
- */
-static bool named_swap_file_range_mapped_elsewhere(struct vm_area_struct *vma)
-{
-	struct mm_struct *mm = vma->vm_mm;
-	struct vm_area_struct *tmp;
-	unsigned long nr;
-	pgoff_t start, last;
-	VMA_ITERATOR(vmi, mm, 0);
-
-	if (!mm || !vma->vm_file)
-		return false;
-	nr = vma_pages(vma);
-	if (!nr)
-		return false;
-	start = vma->vm_pgoff;
-	last = start + nr - 1;
-
-	for_each_vma(vmi, tmp) {
-		unsigned long n = vma_pages(tmp);
-		pgoff_t a, b;
-
-		if (tmp == vma || tmp->vm_file != vma->vm_file || !n)
-			continue;
-		a = tmp->vm_pgoff;
-		b = a + n - 1;
-		if (a <= last && b >= start)
-			return true;
-	}
-	return false;
-}
-
-/*
- * Drop backing for a named-swap VMA the same way munmap does: shrink the
- * file when this range is the tail, otherwise punch a hole and keep i_size.
- * Relocate (mremap MAYMOVE) is not a drop: skip if another VMA still maps
- * these offsets.
+ * Munmap teardown: set i_size to live VMA need (0 if last mapping) and
+ * mark holes dirty so flush punches ranges no VMA still covers. PROT_NONE
+ * does not call this.
  */
 void named_swap_uncommit_queue(struct vm_area_struct *vma)
 {
@@ -1428,6 +1626,345 @@ int named_swap_allocate_vma(struct vm_area_struct *vma,
 			       old_size, named_swap_file_size(file),
 			       named_swap_vma_index(vma), ret);
 	return ret;
+}
+
+struct named_swap_artifact_walk {
+	struct address_space *mapping;
+	u64 index;
+	unsigned long *keep;
+	unsigned long npages;
+};
+
+static void named_swap_artifact_keep(unsigned long *keep, unsigned long npages,
+				     pgoff_t index, unsigned int nr)
+{
+	if (!keep || !nr || index >= npages)
+		return;
+	if (index + nr > npages)
+		nr = npages - index;
+	bitmap_set(keep, index, nr);
+}
+
+static int named_swap_artifact_split_pmd(pmd_t *pmd, unsigned long addr,
+					 unsigned long next,
+					 struct mm_walk *walk)
+{
+	if (is_swap_pmd(*pmd) || pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
+		split_huge_pmd(walk->vma, pmd, addr);
+	return 0;
+}
+
+static int named_swap_artifact_pte(pte_t *ptep, unsigned long addr,
+				   unsigned long next, struct mm_walk *walk)
+{
+	struct named_swap_artifact_walk *ctx = walk->private;
+	struct vm_area_struct *vma = walk->vma;
+	pte_t pte;
+	pgoff_t pgoff;
+	struct folio *folio;
+
+	if (!vma)
+		return 0;
+
+	pte = ptep_get(ptep);
+	if (pte_none(pte))
+		return 0;
+
+	pgoff = linear_page_index(vma, addr);
+	if (pte_present(pte)) {
+		if (is_zero_pfn(pte_pfn(pte)))
+			return 0;
+		folio = vm_normal_folio(vma, addr, pte);
+		if (folio && folio->mapping == ctx->mapping)
+			named_swap_artifact_keep(ctx->keep, ctx->npages,
+						 folio->index,
+						 folio_nr_pages(folio));
+		return 0;
+	}
+
+	if (is_named_swap_pte(pte)) {
+		swp_entry_t entry = pte_to_swp_entry(pte);
+
+		if (named_swap_entry_index(entry) == ctx->index)
+			named_swap_artifact_keep(ctx->keep, ctx->npages,
+						 pgoff, 1);
+	}
+	return 0;
+}
+
+static const struct mm_walk_ops named_swap_artifact_wrlock_ops = {
+	.pmd_entry	= named_swap_artifact_split_pmd,
+	.pte_entry	= named_swap_artifact_pte,
+	.walk_lock	= PGWALK_WRLOCK,
+};
+
+static const struct mm_walk_ops named_swap_artifact_rdlock_ops = {
+	.pmd_entry	= named_swap_artifact_split_pmd,
+	.pte_entry	= named_swap_artifact_pte,
+	.walk_lock	= PGWALK_RDLOCK,
+};
+
+static void named_swap_artifact_scan_xarray(struct address_space *mapping,
+					    unsigned long *keep,
+					    unsigned long npages)
+{
+	XA_STATE(xas, &mapping->i_pages, 0);
+	void *entry;
+
+	if (!mapping || !npages)
+		return;
+
+	rcu_read_lock();
+	xas_for_each(&xas, entry, npages - 1) {
+		pgoff_t index;
+		unsigned int nr = 1;
+
+		if (xas_retry(&xas, entry))
+			continue;
+		index = xas.xa_index;
+		if (!xa_is_value(entry)) {
+			struct folio *folio = entry;
+
+			index = folio->index;
+			nr = folio_nr_pages(folio);
+		}
+		named_swap_artifact_keep(keep, npages, index, nr);
+	}
+	rcu_read_unlock();
+}
+
+static void named_swap_artifact_walk_vma(struct vm_area_struct *vma,
+					 const struct mm_walk_ops *ops,
+					 struct named_swap_artifact_walk *ctx)
+{
+	if (!vma || !vma_is_named_swap(vma))
+		return;
+	walk_page_vma(vma, ops, ctx);
+}
+
+#define NAMED_SWAP_ARTIFACT_VMA_MAX 64
+#define NAMED_SWAP_ARTIFACT_MM_MAX 32
+
+static int named_swap_artifact_scan_ptes(struct anon_vma *anon_vma,
+					 struct mm_struct *only_mm,
+					 struct named_swap_artifact_walk *ctx)
+{
+	struct anon_vma_chain *avc;
+	struct vm_area_struct *vmas[NAMED_SWAP_ARTIFACT_VMA_MAX];
+	unsigned int n = 0, i;
+	pgoff_t last = ctx->npages - 1;
+
+	if (only_mm)
+		mmap_assert_write_locked(only_mm);
+
+	anon_vma_lock_read(anon_vma);
+	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, 0, last) {
+		struct vm_area_struct *vma = avc->vma;
+
+		if (!vma)
+			continue;
+		if (only_mm && vma->vm_mm != only_mm)
+			continue;
+		if (n == NAMED_SWAP_ARTIFACT_VMA_MAX) {
+			anon_vma_unlock_read(anon_vma);
+			return -ENOMEM;
+		}
+		vmas[n++] = vma;
+	}
+	anon_vma_unlock_read(anon_vma);
+
+	if (only_mm) {
+		for (i = 0; i < n; i++)
+			named_swap_artifact_walk_vma(vmas[i],
+					&named_swap_artifact_wrlock_ops, ctx);
+		return 0;
+	}
+
+	{
+		struct mm_struct *mms[NAMED_SWAP_ARTIFACT_MM_MAX];
+		unsigned int nm = 0, j;
+		bool overflow = false;
+
+		for (i = 0; i < n; i++) {
+			struct mm_struct *mm = vmas[i]->vm_mm;
+
+			if (!mm || !mmget_not_zero(mm))
+				continue;
+			for (j = 0; j < nm; j++) {
+				if (mms[j] == mm) {
+					mmput(mm);
+					goto next_vma;
+				}
+			}
+			if (nm == NAMED_SWAP_ARTIFACT_MM_MAX) {
+				mmput(mm);
+				overflow = true;
+				break;
+			}
+			mms[nm++] = mm;
+next_vma:
+			;
+		}
+
+		if (overflow) {
+			for (i = 0; i < nm; i++)
+				mmput(mms[i]);
+			return -ENOMEM;
+		}
+
+		for (i = 0; i < nm; i++) {
+			struct vm_area_struct *vma;
+			VMA_ITERATOR(vmi, mms[i], 0);
+
+			if (mmap_read_lock_killable(mms[i])) {
+				mmput(mms[i]);
+				continue;
+			}
+			for_each_vma(vmi, vma)
+				named_swap_artifact_walk_vma(vma,
+					&named_swap_artifact_rdlock_ops, ctx);
+			mmap_read_unlock(mms[i]);
+			mmput(mms[i]);
+		}
+	}
+	return 0;
+}
+
+static void named_swap_artifact_punch(struct named_swap_file *ns,
+				      unsigned long *keep, unsigned long npages)
+{
+	struct file *lower = ns->lower;
+	unsigned long start, end;
+	unsigned long punched = 0;
+
+	if (!lower || !npages)
+		return;
+
+	for_each_clear_bitrange(start, end, keep, npages) {
+		loff_t off = (loff_t)start << PAGE_SHIFT;
+		loff_t len = (loff_t)(end - start) << PAGE_SHIFT;
+		long ret;
+
+		ret = named_swap_fallocate_lower_gfp(lower,
+				FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+				off, len, false);
+		if (!ret)
+			punched += end - start;
+	}
+	if (!punched)
+		return;
+	if (punched > ns->nr_pages)
+		punched = ns->nr_pages;
+	named_swap_storage_release(punched, ns->pool);
+	ns->nr_pages -= punched;
+}
+
+/*
+ * Punch after dropping mmap_lock. Doing vfs_fallocate() in dup_mmap()
+ * while holding mmap write inverts inode->i_rwsem vs mmap_lock (GUP
+ * takes mmap under the inode lock).
+ */
+static void named_swap_artifact_punch_work(struct work_struct *work)
+{
+	struct named_swap_file *ns =
+		container_of(work, struct named_swap_file, punch_work);
+	struct file *file;
+	unsigned long *keep;
+	unsigned long npages;
+
+	spin_lock(&ns->bind_lock);
+	keep = ns->punch_keep;
+	npages = ns->punch_npages;
+	file = ns->punch_file;
+	ns->punch_keep = NULL;
+	ns->punch_npages = 0;
+	ns->punch_file = NULL;
+	spin_unlock(&ns->bind_lock);
+
+	if (keep) {
+		named_swap_artifact_punch(ns, keep, npages);
+		kvfree(keep);
+	}
+	if (file)
+		fput(file);
+}
+
+/*
+ * Mark a named-swap file non-allocatable and punch never-allocated
+ * reservations. only_mm restricts the PTE walk (fork: parent mm).
+ * No-op while the file's anon_vma still has active allocators.
+ */
+void named_swap_artifact_file(struct file *file, struct mm_struct *only_mm)
+{
+	struct named_swap_file *ns;
+	struct address_space *mapping;
+	struct anon_vma *anon_vma;
+	struct named_swap_artifact_walk ctx;
+	unsigned long *keep;
+	unsigned long npages;
+	loff_t size;
+	int err;
+
+	if (!file || !mapping_named_swap(file->f_mapping))
+		return;
+
+	ns = file->private_data;
+	if (!ns || ns->artifact)
+		return;
+
+	mapping = file->f_mapping;
+	anon_vma = mapping->anon_vma;
+	if (!anon_vma)
+		return;
+
+	anon_vma_lock_read(anon_vma);
+	if (anon_vma->num_active_vmas) {
+		anon_vma_unlock_read(anon_vma);
+		return;
+	}
+	anon_vma_unlock_read(anon_vma);
+
+	spin_lock(&ns->bind_lock);
+	if (ns->artifact) {
+		spin_unlock(&ns->bind_lock);
+		return;
+	}
+	ns->artifact = true;
+	spin_unlock(&ns->bind_lock);
+
+	size = named_swap_file_size(file);
+	if (size <= 0)
+		return;
+
+	npages = DIV_ROUND_UP((unsigned long)size, PAGE_SIZE);
+	keep = kvcalloc(BITS_TO_LONGS(npages), sizeof(unsigned long),
+			GFP_NOWAIT | __GFP_NOWARN);
+	if (!keep)
+		return;
+
+	ctx.mapping = mapping;
+	ctx.index = ns->index;
+	ctx.keep = keep;
+	ctx.npages = npages;
+
+	named_swap_artifact_scan_xarray(mapping, keep, npages);
+	err = named_swap_artifact_scan_ptes(anon_vma, only_mm, &ctx);
+	if (err) {
+		kvfree(keep);
+		return;
+	}
+
+	spin_lock(&ns->bind_lock);
+	if (ns->punch_keep) {
+		spin_unlock(&ns->bind_lock);
+		kvfree(keep);
+		return;
+	}
+	ns->punch_keep = keep;
+	ns->punch_npages = npages;
+	ns->punch_file = get_file(file);
+	spin_unlock(&ns->bind_lock);
+	schedule_work(&ns->punch_work);
 }
 
 static void named_swap_xa_destroy(void)
@@ -1693,6 +2230,13 @@ static int named_swap_release(struct inode *inode, struct file *file)
 	if (!ns)
 		return 0;
 
+	/*
+	 * punch_work holds a wrapper ref until it finishes, so release
+	 * runs after the work (or the work was never queued). Do not
+	 * cancel_work_sync() here: the work's fput is a common caller.
+	 */
+	WARN_ON(ns->punch_keep || ns->punch_file);
+
 	lower = ns->lower;
 	if (lower) {
 		trace_named_swap_file_release(file, ns->index, ns->nr_pages);
@@ -1727,6 +2271,8 @@ static long named_swap_fallocate(struct file *file, int mode, loff_t offset, lof
 
 	if (old_size < 0)
 		return old_size;
+	if (ns && ns->artifact && !(mode & FALLOC_FL_PUNCH_HOLE))
+		return -EPERM;
 	if (!(mode & FALLOC_FL_PUNCH_HOLE)) {
 		ret = named_swap_account_reserve_end(ns, offset + len, &pages);
 		if (ret)
@@ -2044,6 +2590,7 @@ static struct file *named_swap_create_file(unsigned long len, bool allocate)
 	ns->index = index;
 	ns->pool = pool;
 	ns->nr_pages = pages;
+	INIT_WORK(&ns->punch_work, named_swap_artifact_punch_work);
 
 	file = anon_inode_create_getfile("[named_swap]", &named_swap_fops, ns,
 				  O_RDWR | O_LARGEFILE, NULL);
@@ -2107,6 +2654,7 @@ static struct file *named_swap_create_file(unsigned long len, bool allocate)
 		}
 	}
 	i_size_write(inode, i_size_read(file_inode(lower)));
+	ns->vfs_size = i_size_read(file_inode(lower));
 	trace_named_swap_file_create(file, index, len, 0);
 	lower->f_mapping->anon_vma = NULL;
 
@@ -2143,7 +2691,6 @@ struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag,
  * in named_swap_file (wrapper private_data).  Safe in page faults.
  * Call after anon_vma_prepare(); may take get_file() on first link.
  */
-
 /*
  * One named-swap file mapping <-> one anon_vma. The first creator
  * publishes allocated; later faults adopt the winner.
@@ -2182,6 +2729,7 @@ void named_swap_link(struct vm_area_struct *vma)
 	struct address_space *mapping = file->f_mapping;
 	u64 old_index = 0;
 	bool drop_old_index = false;
+	bool keep_old_index = false;
 	bool refresh_link;
 
 	VM_BUG_ON_VMA(!anon_vma, vma);
@@ -2203,9 +2751,13 @@ void named_swap_link(struct vm_area_struct *vma)
 
 			if (old_mapping->anon_vma == anon_vma)
 				old_mapping->anon_vma = NULL;
+			else if (old_mapping->anon_vma)
+				keep_old_index = true;
 			if (old_ns) {
 				old_index = old_ns->index;
 				drop_old_index = true;
+				if (old_ns->artifact)
+					keep_old_index = true;
 			}
 		}
 		get_file(file);
@@ -2214,7 +2766,7 @@ void named_swap_link(struct vm_area_struct *vma)
 	spin_unlock(&ns->bind_lock);
 	if (old_file) {
 		fput(old_file);
-		if (drop_old_index)
+		if (drop_old_index && !keep_old_index)
 			named_swap_xa_remove(old_index);
 	}
 	trace_named_swap_link(file, vma, anon_vma, ns->index, refresh_link);

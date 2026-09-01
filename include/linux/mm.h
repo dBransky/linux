@@ -1016,8 +1016,8 @@ enum named_swap_pool_stat {
 };
 
 extern int named_swap_min_vma_size;
-extern int named_swap_debug;
 extern int named_swap_flush;
+extern int named_swap_debug;
 
 #define NAMED_SWAP_DBG_HIST	0x01	/* record enlarge/shrink ring */
 #define NAMED_SWAP_DBG_PRINT	0x02	/* printk every resize */
@@ -1058,6 +1058,8 @@ unsigned long named_swap_total_pages(void);
 struct file *named_swap_prepare_mmap(unsigned long len, unsigned long *flag,
 				     bool allocate);
 int named_swap_uncommit(struct vm_area_struct *vma);
+void named_swap_uncommit_queue(struct vm_area_struct *vma);
+void named_swap_fs_flush(void);
 int named_swap_allocate_vma(struct vm_area_struct *vma,
 			    unsigned long start, unsigned long end);
 char *named_swap_file_path(struct file *file, char *buf, int buflen);
@@ -1065,12 +1067,19 @@ void named_swap_link(struct vm_area_struct *vma);
 void named_swap_unlink(struct anon_vma *anon_vma);
 struct anon_vma *named_swap_claim_anon_vma(struct file *file,
 					   struct anon_vma *allocated);
+void named_swap_artifact_file(struct file *file, struct mm_struct *only_mm);
 int named_swap_file_index(struct file *file, u64 *index);
 u64 named_swap_mapping_index(struct address_space *mapping);
 bool named_swap_single_vma_mapping(struct vm_area_struct *vma);
 unsigned int named_swap_same_file_pte_count(struct vm_area_struct *vma,
 					   unsigned long address);
 void setup_named_swap_vmf(struct vm_fault *vmf);
+loff_t named_swap_file_blocks(struct file *file);
+loff_t named_swap_file_size(struct file *file);
+int named_swap_enlarge(struct vm_area_struct *vma, unsigned long delta);
+int named_swap_shrink(struct vm_area_struct *vma, unsigned long delta);
+int named_swap_deallocate(struct vm_area_struct *vma, unsigned long start,
+			  unsigned long end);
 void named_swap_debug_user_segv(struct pt_regs *regs, unsigned long address,
 				unsigned long error_code, int si_code,
 				struct vm_area_struct *vma);
@@ -1078,14 +1087,6 @@ void named_swap_check_fault(struct vm_fault *vmf);
 int named_swap_hist_show(struct seq_file *m, void *v);
 void named_swap_note_written(struct vm_area_struct *vma, unsigned long addr);
 void named_swap_check_zero_read(struct vm_area_struct *vma, unsigned long addr);
-loff_t named_swap_file_blocks(struct file *file);
-loff_t named_swap_file_size(struct file *file);
-void named_swap_uncommit_queue(struct vm_area_struct *vma);
-void named_swap_fs_flush(void);
-int named_swap_enlarge(struct vm_area_struct *vma, unsigned long delta);
-int named_swap_shrink(struct vm_area_struct *vma, unsigned long delta);
-int named_swap_deallocate(struct vm_area_struct *vma, unsigned long start,
-			  unsigned long end);
 void named_swap_drop_prepared_file(struct file *file);
 bool is_file_named_swap(struct file *file);
 void named_swap_store_pte(struct mm_struct *mm, struct vm_area_struct *vma,
